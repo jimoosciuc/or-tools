@@ -3,9 +3,6 @@ name: amd64 Windows CMake Java
 
 on:
   push:
-    branches:
-      - ci
-      - main
   workflow_dispatch:
 
 concurrency:
