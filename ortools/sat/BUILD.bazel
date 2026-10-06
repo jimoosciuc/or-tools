@@ -507,6 +507,7 @@ cc_library(
         ":precedences",
         ":presolve_context",
         ":probing",
+        ":runtime_progress",
         ":rins",
         ":sat_base",
         ":sat_inprocessing",

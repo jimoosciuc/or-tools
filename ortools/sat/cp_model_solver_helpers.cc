@@ -71,6 +71,7 @@
 #include "ortools/sat/optimization.h"
 #include "ortools/sat/precedences.h"
 #include "ortools/sat/probing.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/sat_solver.h"
@@ -1093,77 +1094,117 @@ void LoadBaseModel(const CpModelProto& model_proto, Model* model) {
 
   auto* mapping = model->GetOrCreate<CpModelMapping>();
   const SatParameters& parameters = *(model->GetOrCreate<SatParameters>());
+  const bool runtime_diagnostics = parameters.cp_sat_runtime_diagnostics();
+  const std::string owner = model->Name();
   const bool view_all_booleans_as_integers =
       (parameters.linearization_level() >= 2) ||
       (parameters.search_branching() == SatParameters::FIXED_SEARCH &&
        model_proto.search_strategy().empty()) ||
       parameters.optimize_with_max_hs();
-  LoadVariables(model_proto, view_all_booleans_as_integers, model);
-  DetectOptionalVariables(model_proto, model);
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "variables_and_encoding");
+    LoadVariables(model_proto, view_all_booleans_as_integers, model);
+    DetectOptionalVariables(model_proto, model);
 
-  // TODO(user): The core algo and symmetries seems to be problematic in some
-  // cases. See for instance: neos-691058.mps.gz. This is probably because as
-  // we modify the model, our symmetry might be wrong? investigate.
-  //
-  // TODO(user): More generally, we cannot load the symmetry if we create
-  // new Booleans and constraints that link them to some Booleans of the model.
-  // Creating Booleans related to integer variable is fine since we only deal
-  // with Boolean only symmetry here. It is why we disable this when we have
-  // linear relaxation as some of them create new constraints.
-  if (!parameters.optimize_with_core() && parameters.symmetry_level() > 1 &&
-      !parameters.enumerate_all_solutions() &&
-      parameters.linearization_level() == 0) {
-    LoadBooleanSymmetries(model_proto, model);
+    // TODO(user): The core algo and symmetries seems to be problematic in some
+    // cases. See for instance: neos-691058.mps.gz. This is probably because as
+    // we modify the model, our symmetry might be wrong? investigate.
+    //
+    // TODO(user): More generally, we cannot load the symmetry if we create
+    // new Booleans and constraints that link them to some Booleans of the model.
+    // Creating Booleans related to integer variable is fine since we only deal
+    // with Boolean only symmetry here. It is why we disable this when we have
+    // linear relaxation as some of them create new constraints.
+    if (!parameters.optimize_with_core() && parameters.symmetry_level() > 1 &&
+        !parameters.enumerate_all_solutions() &&
+        parameters.linearization_level() == 0) {
+      LoadBooleanSymmetries(model_proto, model);
+    }
+
+    ExtractEncoding(model_proto, model);
+    PropagateEncodingFromEquivalenceRelations(model_proto, model);
+
+    // Check the model is still feasible before continuing.
+    if (sat_solver->ModelIsUnsat()) return unsat();
+
+    // Fully encode variables as needed by the search strategy.
+    AddFullEncodingFromSearchBranching(model_proto, model);
+    if (sat_solver->ModelIsUnsat()) return unsat();
+
+    // Reserve space for the precedence relations.
+    model->GetOrCreate<PrecedenceRelations>()->Resize(
+        model->GetOrCreate<IntegerTrail>()->NumIntegerVariables().value());
   }
-
-  ExtractEncoding(model_proto, model);
-  PropagateEncodingFromEquivalenceRelations(model_proto, model);
-
-  // Check the model is still feasible before continuing.
-  if (sat_solver->ModelIsUnsat()) return unsat();
-
-  // Fully encode variables as needed by the search strategy.
-  AddFullEncodingFromSearchBranching(model_proto, model);
-  if (sat_solver->ModelIsUnsat()) return unsat();
-
-  // Reserve space for the precedence relations.
-  model->GetOrCreate<PrecedenceRelations>()->Resize(
-      model->GetOrCreate<IntegerTrail>()->NumIntegerVariables().value());
 
   // Load the constraints.
   int num_ignored_constraints = 0;
   absl::flat_hash_set<ConstraintProto::ConstraintCase> unsupported_types;
-  for (const ConstraintProto& ct : model_proto.constraints()) {
-    if (mapping->ConstraintIsAlreadyLoaded(&ct)) {
-      ++num_ignored_constraints;
-      continue;
-    }
+  int64_t processed_constraints = 0;
+  const int64_t progress_period_ns =
+      static_cast<int64_t>(parameters.cp_sat_runtime_diagnostics_period_seconds()) *
+      1'000'000'000LL;
+  const int64_t load_constraints_start_ns =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
+  int64_t last_constraint_progress_ns = load_constraints_start_ns;
+  int64_t next_progress_check = 1024;
+  ConstraintProto::ConstraintCase current_type =
+      ConstraintProto::ConstraintCase::CONSTRAINT_NOT_SET;
+  auto maybe_log_constraint_progress = [&]() {
+    if (!runtime_diagnostics || processed_constraints < next_progress_check) return;
+    next_progress_check = processed_constraints + 1024;
+    const int64_t now = RuntimeProgressNowNanos();
+    if (now - last_constraint_progress_ns < progress_period_ns) return;
+    RuntimeProgressPrint(absl::StrCat(
+        "CP-SAT-RUNTIME event=PROGRESS owner=", owner,
+        " phase=worker_load operation=load_constraints processed=",
+        processed_constraints, " total=", model_proto.constraints_size(),
+        " current_index=", processed_constraints - 1,
+        " current_type=", ConstraintCaseName(current_type),
+        " elapsed_ns=", now - load_constraints_start_ns,
+        " period_elapsed_ns=", now - last_constraint_progress_ns, "\n"));
+    last_constraint_progress_ns = now;
+  };
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "load_constraints");
+    for (const ConstraintProto& ct : model_proto.constraints()) {
+      current_type = ct.constraint_case();
+      ++processed_constraints;
+      if (mapping->ConstraintIsAlreadyLoaded(&ct)) {
+        ++num_ignored_constraints;
+        maybe_log_constraint_progress();
+        continue;
+      }
 
-    if (!LoadConstraint(ct, model)) {
-      unsupported_types.insert(ct.constraint_case());
-      continue;
-    }
+      if (!LoadConstraint(ct, model)) {
+        unsupported_types.insert(ct.constraint_case());
+        maybe_log_constraint_progress();
+        continue;
+      }
 
-    // We propagate after each new Boolean constraint but not the integer
-    // ones. So we call FinishPropagation() manually here.
-    //
-    // Note that we only do that in debug mode as this can be really slow on
-    // certain types of problems with millions of constraints.
-    if (DEBUG_MODE) {
-      if (sat_solver->FinishPropagation()) {
-        Trail* trail = model->GetOrCreate<Trail>();
-        const int old_num_fixed = trail->Index();
-        if (trail->Index() > old_num_fixed) {
-          VLOG(3) << "Constraint fixed " << trail->Index() - old_num_fixed
-                  << " Boolean variable(s): " << ProtobufDebugString(ct);
+      // We propagate after each new Boolean constraint but not the integer
+      // ones. So we call FinishPropagation() manually here.
+      //
+      // Note that we only do that in debug mode as this can be really slow on
+      // certain types of problems with millions of constraints.
+      if (DEBUG_MODE) {
+        if (sat_solver->FinishPropagation()) {
+          Trail* trail = model->GetOrCreate<Trail>();
+          const int old_num_fixed = trail->Index();
+          if (trail->Index() > old_num_fixed) {
+            VLOG(3) << "Constraint fixed " << trail->Index() - old_num_fixed
+                    << " Boolean variable(s): " << ProtobufDebugString(ct);
+          }
         }
       }
-    }
-    if (sat_solver->ModelIsUnsat()) {
-      VLOG(2) << "UNSAT during extraction (after adding '"
-              << ConstraintCaseName(ct.constraint_case()) << "'). "
-              << ProtobufDebugString(ct);
-      return unsat();
+      if (sat_solver->ModelIsUnsat()) {
+        VLOG(2) << "UNSAT during extraction (after adding '"
+                << ConstraintCaseName(ct.constraint_case()) << "'). "
+                << ProtobufDebugString(ct);
+        return unsat();
+      }
+      maybe_log_constraint_progress();
     }
   }
   if (num_ignored_constraints > 0) {
@@ -1188,15 +1229,22 @@ void LoadBaseModel(const CpModelProto& model_proto, Model* model) {
     return unsat();
   }
 
-  model->GetOrCreate<IntegerEncoder>()
-      ->AddAllImplicationsBetweenAssociatedLiterals();
-  if (!sat_solver->FinishPropagation()) return unsat();
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "base_final_propagation");
+    model->GetOrCreate<IntegerEncoder>()
+        ->AddAllImplicationsBetweenAssociatedLiterals();
+    if (!sat_solver->FinishPropagation()) return unsat();
+  }
 
-  model->GetOrCreate<ProductDetector>()->ProcessImplicationGraph(
-      model->GetOrCreate<BinaryImplicationGraph>());
-  model->GetOrCreate<PrecedenceRelations>()->Build();
-
-  model->GetOrCreate<BinaryRelationRepository>()->Build();
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "build_relations");
+    model->GetOrCreate<ProductDetector>()->ProcessImplicationGraph(
+        model->GetOrCreate<BinaryImplicationGraph>());
+    model->GetOrCreate<PrecedenceRelations>()->Build();
+    model->GetOrCreate<BinaryRelationRepository>()->Build();
+  }
 }
 
 void LoadFeasibilityPump(const CpModelProto& model_proto, Model* model) {
@@ -1232,12 +1280,23 @@ void LoadFeasibilityPump(const CpModelProto& model_proto, Model* model) {
 // Loads a CpModelProto inside the given model.
 // This should only be called once on a given 'Model' class.
 void LoadCpModel(const CpModelProto& model_proto, Model* model) {
-  LoadBaseModel(model_proto, model);
+  const SatParameters& runtime_parameters = *(model->GetOrCreate<SatParameters>());
+  const bool runtime_diagnostics = runtime_parameters.cp_sat_runtime_diagnostics();
+  const std::string owner = model->Name();
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "load_base_model");
+    LoadBaseModel(model_proto, model);
+  }
 
   // We want to load the debug solution before the initial propag.
   // But at this point the objective is not loaded yet, so we will not have
   // a value for the objective integer variable, so we do it again later.
-  InitializeDebugSolution(model_proto, model);
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "initialize_debug_solution");
+    InitializeDebugSolution(model_proto, model);
+  }
 
   // Simple function for the few places where we do "return unsat()".
   auto* sat_solver = model->GetOrCreate<SatSolver>();
@@ -1256,6 +1315,8 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
   // LP relaxation), because propagation will be faster at this point and it
   // should be enough for the purpose of this auto-detection.
   if (parameters.auto_detect_greater_than_at_least_one_of()) {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "auto_detect_precedences");
     model->GetOrCreate<GreaterThanAtLeastOneOfDetector>()
         ->AddGreaterThanAtLeastOneOfConstraints(model);
     if (!sat_solver->FinishPropagation()) return unsat();
@@ -1269,6 +1330,8 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
   // TODO(user): We don't have a good deterministic time on all constraints,
   // so this might take more time than wanted.
   if (parameters.cp_model_probing_level() > 1) {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "probing_and_transitive_reduction");
     Prober* prober = model->GetOrCreate<Prober>();
     if (!prober->ProbeBooleanVariables(/*deterministic_time_limit=*/1.0)) {
       return unsat();
@@ -1281,12 +1344,16 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
   if (sat_solver->ModelIsUnsat()) return unsat();
 
   // Note that it is important to do that after the probing.
-  ExtractElementEncoding(model_proto, model);
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "element_and_interval_initialization");
+    ExtractElementEncoding(model_proto, model);
 
-  // Compute decomposed energies on demands helper.
-  IntervalsRepository* repository = model->Mutable<IntervalsRepository>();
-  if (repository != nullptr) {
-    repository->InitAllDecomposedEnergies();
+    // Compute decomposed energies on demands helper.
+    IntervalsRepository* repository = model->Mutable<IntervalsRepository>();
+    if (repository != nullptr) {
+      repository->InitAllDecomposedEnergies();
+    }
   }
 
   // We need to know beforehand if the objective var can just be >= terms or
@@ -1319,8 +1386,12 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
   IntegerVariable objective_var = kNoIntegerVariable;
   if (parameters.linearization_level() > 0) {
     // Linearize some part of the problem and register LP constraint(s).
-    objective_var =
-        AddLPConstraints(objective_need_to_be_tight, model_proto, model);
+    {
+      RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                                 "objective_linearization");
+      objective_var =
+          AddLPConstraints(objective_need_to_be_tight, model_proto, model);
+    }
     if (sat_solver->ModelIsUnsat()) return unsat();
   } else if (model_proto.has_objective()) {
     const CpObjectiveProto& obj = model_proto.objective();
@@ -1404,12 +1475,15 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
       return unsat();
     }
   }
-
   // Note that we do one last propagation at level zero once all the
   // constraints were added.
   SOLVER_LOG(model->GetOrCreate<SolverLogger>(),
              "Initial num_bool: ", sat_solver->NumVariables());
-  if (!sat_solver->FinishPropagation()) return unsat();
+  {
+    RuntimeProgressStage stage(runtime_diagnostics, owner, "worker_load",
+                               "final_propagation");
+    if (!sat_solver->FinishPropagation()) return unsat();
+  }
 
   if (model_proto.has_objective()) {
     // Report the initial objective variable bounds.
@@ -1432,6 +1506,9 @@ void LoadCpModel(const CpModelProto& model_proto, Model* model) {
   }
 
   // Initialize the search strategies.
+  RuntimeProgressStage search_setup_stage(runtime_diagnostics, owner,
+                                          "worker_load",
+                                          "search_and_optimizer_setup");
   auto* search_heuristics = model->GetOrCreate<SearchHeuristics>();
   search_heuristics->user_search =
       ConstructUserSearchStrategy(model_proto, model);
