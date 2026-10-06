@@ -31,6 +31,7 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/base/attributes.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
@@ -42,6 +43,7 @@
 #include "absl/numeric/int128.h"
 #include "absl/random/distributions.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "google/protobuf/arena.h"
@@ -12636,6 +12638,10 @@ void CpModelPresolver::PresolveToFixPoint() {
       context_->params().cp_sat_runtime_diagnostics();
   RuntimeProgressStage stage(runtime_diagnostics, "presolve",
                              "PresolveToFixPoint", "constraint_queue");
+  context_->BeginRuntimeDomainChangeCollection();
+  absl::Cleanup domain_change_scope = [this] {
+    context_->EndRuntimeDomainChangeCollection();
+  };
   const int64_t runtime_period_ns =
       static_cast<int64_t>(context_->params()
                                .cp_sat_runtime_diagnostics_period_seconds()) *
@@ -12767,12 +12773,49 @@ void CpModelPresolver::PresolveToFixPoint() {
             rule_summary += " rule_stats_include_TODO=true";
             rule_summary += " operations_exclude_TODO=true";
           }
+          const auto& domain_changes = context_->runtime_domain_changes();
+          std::array<std::pair<int64_t, int>, 5> domain_top{};
+          constexpr int kDomainTopSize = 5;
+          domain_top.fill({0, std::numeric_limits<int>::max()});
+          for (const auto& [id, stats] : domain_changes) {
+            int position = 0;
+            while (position < kDomainTopSize &&
+                   (domain_top[position].first > stats.count ||
+                    (domain_top[position].first == stats.count &&
+                     domain_top[position].second < id))) {
+              ++position;
+            }
+            if (position == kDomainTopSize) continue;
+            for (int i = kDomainTopSize - 1; i > position; --i) {
+              domain_top[i] = domain_top[i - 1];
+            }
+            domain_top[position] = {stats.count, id};
+          }
+          std::string domain_summary = " intersect_domain_top5=";
+          bool has_domain_change = false;
+          for (const auto& [count, id] : domain_top) {
+            if (count == 0) continue;
+            has_domain_change = true;
+            const auto& stats = domain_changes.at(id);
+            const std::string name = absl::CEscape(
+                context_->working_model->variables(id).name());
+            absl::StrAppend(&domain_summary, "[id=", id, ",name=\"", name,
+                            "\",nonempty_domain_updates=", count,
+                            ",first_range=[", stats.first_min, ",",
+                            stats.first_max, "],last_range=[", stats.last_min,
+                            ",", stats.last_max, "],range_summary=min_max]");
+          }
+          if (!has_domain_change) domain_summary += "none";
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=PROGRESS owner=presolve phase=fixpoint",
               " processed_constraints=", processed_constraints,
               " queued_constraints=", queue.size(), " loops=", num_loops,
               " operations=", context_->num_presolve_operations,
+              " model_variables=", context_->working_model->variables_size(),
+              " model_constraints=",
+              context_->working_model->constraints_size(),
               " rule_stats_period_ns=", period_ns, rule_summary,
+              domain_summary,
               " last_constraint=", c, " type=",
               ConstraintCaseName(context_->working_model->constraints(c)
                                      .constraint_case()),
@@ -12781,6 +12824,7 @@ void CpModelPresolver::PresolveToFixPoint() {
           if (rule_stats_available) {
             previous_rule_stats = context_->rule_stats();
           }
+          context_->ClearRuntimeDomainChangesForNextPeriod();
         }
       }
     }

@@ -71,6 +71,30 @@ int SavedVariable::Get() const { return ref_; }
 
 void PresolveContext::ClearStats() { stats_by_rule_name_.clear(); }
 
+void PresolveContext::BeginRuntimeDomainChangeCollection() {
+  collecting_runtime_domain_changes_ = params_.cp_sat_runtime_diagnostics();
+  runtime_domain_changes_.clear();
+}
+
+void PresolveContext::EndRuntimeDomainChangeCollection() {
+  collecting_runtime_domain_changes_ = false;
+  runtime_domain_changes_.clear();
+}
+
+void PresolveContext::RecordRuntimeDomainChange(int var, int64_t old_min,
+                                                int64_t old_max,
+                                                int64_t new_min,
+                                                int64_t new_max) {
+  RuntimeDomainChange& stats = runtime_domain_changes_[var];
+  if (stats.count == 0) {
+    stats.first_min = old_min;
+    stats.first_max = old_max;
+  }
+  ++stats.count;
+  stats.last_min = new_min;
+  stats.last_max = new_max;
+}
+
 int PresolveContext::NewIntVar(const Domain& domain) {
   IntegerVariableProto* const var = working_model->add_variables();
   FillDomainInProto(domain, var);
@@ -526,16 +550,26 @@ ABSL_MUST_USE_RESULT bool PresolveContext::IntersectDomainWith(
     int ref, const Domain& domain, bool* domain_modified) {
   DCHECK(!DomainIsEmpty(ref));
   const int var = PositiveRef(ref);
+  int64_t old_min = 0;
+  int64_t old_max = 0;
 
   if (RefIsPositive(ref)) {
     if (domains_[var].IsIncludedIn(domain)) {
       return true;
+    }
+    if (collecting_runtime_domain_changes_) {
+      old_min = domains_[var].Min();
+      old_max = domains_[var].Max();
     }
     domains_[var] = domains_[var].IntersectionWith(domain);
   } else {
     const Domain temp = domain.Negation();
     if (domains_[var].IsIncludedIn(temp)) {
       return true;
+    }
+    if (collecting_runtime_domain_changes_) {
+      old_min = domains_[var].Min();
+      old_max = domains_[var].Max();
     }
     domains_[var] = domains_[var].IntersectionWith(temp);
   }
@@ -548,6 +582,11 @@ ABSL_MUST_USE_RESULT bool PresolveContext::IntersectDomainWith(
     return NotifyThatModelIsUnsat(
         absl::StrCat("var #", ref, " as empty domain after intersecting with ",
                      domain.ToString()));
+  }
+
+  if (collecting_runtime_domain_changes_) {
+    RecordRuntimeDomainChange(var, old_min, old_max, domains_[var].Min(),
+                              domains_[var].Max());
   }
 
   solution_crush_.SetOrUpdateVarToDomain(var, domains_[var]);

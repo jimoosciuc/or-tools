@@ -94,6 +94,17 @@ ABSL_MUST_USE_RESULT bool ScaleFloatingPointObjective(
 // in-memory domain of each variables and the constraint variable graph.
 class PresolveContext {
  public:
+  struct RuntimeDomainChange {
+    // Successful local intersections that changed the domain and stayed
+    // nonempty.
+    int64_t count = 0;
+    int64_t first_min = 0;
+    int64_t first_max = 0;
+    int64_t last_min = 0;
+    int64_t last_max = 0;
+  };
+  using RuntimeDomainChanges = absl::flat_hash_map<int, RuntimeDomainChange>;
+
   PresolveContext(Model* model, CpModelProto* cp_model, CpModelProto* mapping)
       : working_model(cp_model),
         mapping_model(mapping),
@@ -640,6 +651,16 @@ class PresolveContext {
   const absl::flat_hash_map<std::string, int>& rule_stats() const {
     return stats_by_rule_name_;
   }
+  void BeginRuntimeDomainChangeCollection();
+  void EndRuntimeDomainChangeCollection();
+  const RuntimeDomainChanges& runtime_domain_changes() const {
+    return runtime_domain_changes_;
+  }
+  // Keep the backing array for reuse by the next reporting period.
+  void ClearRuntimeDomainChangesForNextPeriod() {
+    runtime_domain_changes_.erase(runtime_domain_changes_.begin(),
+                                  runtime_domain_changes_.end());
+  }
   TimeLimit* time_limit() { return time_limit_; }
   ModelRandomGenerator* random() { return random_; }
 
@@ -688,6 +709,8 @@ class PresolveContext {
 
   void AddVariableUsage(int c);
   void UpdateLinear1Usage(const ConstraintProto& ct, int c);
+  void RecordRuntimeDomainChange(int var, int64_t old_min, int64_t old_max,
+                                 int64_t new_min, int64_t new_max);
 
   // Makes sure we only insert encoding about the current representative.
   //
@@ -786,6 +809,8 @@ class PresolveContext {
 
   // Just used to display statistics on the presolve rules that were used.
   absl::flat_hash_map<std::string, int> stats_by_rule_name_;
+  bool collecting_runtime_domain_changes_ = false;
+  RuntimeDomainChanges runtime_domain_changes_;
 
   // Used by CanonicalizeLinearExpressionInternal().
   std::vector<std::pair<int, int64_t>> tmp_terms_;
