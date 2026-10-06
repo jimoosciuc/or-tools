@@ -53,6 +53,11 @@ namespace sat {
   }
 
 std::string ValidateParameters(const SatParameters& params) {
+  if (params.cp_sat_runtime_diagnostics() &&
+      params.cp_sat_runtime_diagnostics_period_seconds() <= 0) {
+    return "parameter 'cp_sat_runtime_diagnostics_period_seconds' must be "
+           "positive when cp_sat_runtime_diagnostics is enabled";
+  }
   // Test that all floating point parameters are not NaN or +/- infinity.
   TEST_IS_FINITE(absolute_gap_limit);
   TEST_IS_FINITE(blocking_restart_multiplier);

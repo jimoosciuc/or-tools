@@ -1694,4 +1694,9 @@ message SatParameters {
   // much of that presolve we do. It can help to better scale floating point
   // model, but it is not always behaving nicely.
   optional int32 mip_presolve_level = 261 [default = 2];
+
+  // Emit CP-SAT runtime stage timings and periodic propagation statistics.
+  optional bool cp_sat_runtime_diagnostics = 317 [default = false];
+  optional int32 cp_sat_runtime_diagnostics_period_seconds = 318
+      [default = 30];
 }

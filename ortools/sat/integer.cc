@@ -20,6 +20,7 @@
 #include <limits>
 #include <ostream>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -36,6 +37,7 @@
 #include "ortools/base/strong_vector.h"
 #include "ortools/sat/integer_base.h"
 #include "ortools/sat/model.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/sat_solver.h"
@@ -2090,11 +2092,20 @@ GenericLiteralWatcher::GenericLiteralWatcher(Model* model)
       time_limit_(model->GetOrCreate<TimeLimit>()),
       integer_trail_(model->GetOrCreate<IntegerTrail>()),
       rev_int_repository_(model->GetOrCreate<RevIntRepository>()) {
+  const SatParameters* params = model->GetOrCreate<SatParameters>();
+  runtime_diagnostics_ = params->cp_sat_runtime_diagnostics();
+  runtime_diagnostics_period_seconds_ =
+      params->cp_sat_runtime_diagnostics_period_seconds();
+  runtime_owner_ = model->Name();
+  if (runtime_diagnostics_) {
+    runtime_last_hotspot_publish_ns_ = RuntimeProgressNowNanos();
+  }
   // TODO(user): This propagator currently needs to be last because it is the
   // only one enforcing that a fix-point is reached on the integer variables.
   // Figure out a better interaction between the sat propagation loop and
   // this one.
   model->GetOrCreate<SatSolver>()->AddLastPropagator(this);
+  runtime_sat_solver_ = model->Mutable<SatSolver>();
 
   integer_trail_->RegisterReversibleClass(
       &id_to_greatest_common_level_since_last_call_);
@@ -2222,12 +2233,59 @@ bool GenericLiteralWatcher::Propagate(Trail* trail) {
       const int64_t old_integer_timestamp = integer_trail_->num_enqueues();
       const int64_t old_boolean_timestamp = trail->Index();
 
+      const int64_t runtime_start =
+          runtime_diagnostics_ ? RuntimeProgressNowNanos() : 0;
+
       // TODO(user): Maybe just provide one function Propagate(watch_indices) ?
       ++num_propagate_calls;
       const bool result =
           id_to_watch_indices_[id].empty()
               ? watchers_[id]->Propagate()
               : watchers_[id]->IncrementalPropagate(id_to_watch_indices_[id]);
+      if (runtime_diagnostics_) {
+        RuntimePropagatorStats& stats = runtime_propagator_stats_[id];
+        const int64_t elapsed = RuntimeProgressNowNanos() - runtime_start;
+        ++stats.calls;
+        stats.total_ns += elapsed;
+        stats.max_ns = std::max(stats.max_ns, elapsed);
+        stats.integer_enqueues +=
+            integer_trail_->num_enqueues() - old_integer_timestamp;
+        stats.boolean_enqueues +=
+            std::max<int64_t>(0, trail->Index() - old_boolean_timestamp);
+        if (!result) ++stats.conflicts;
+
+        const int64_t now = RuntimeProgressNowNanos();
+        if (now - runtime_last_hotspot_publish_ns_ >=
+            runtime_diagnostics_period_seconds_ * 1'000'000'000LL) {
+          std::vector<int> top(runtime_propagator_stats_.size());
+          for (int i = 0; i < top.size(); ++i) top[i] = i;
+          const int keep = std::min<int>(5, top.size());
+          std::partial_sort(top.begin(), top.begin() + keep, top.end(),
+                            [this](int a, int b) {
+                              return runtime_propagator_stats_[a].total_ns >
+                                     runtime_propagator_stats_[b].total_ns;
+                            });
+          std::string hotspots;
+          for (int i = 0; i < keep; ++i) {
+            const int hot = top[i];
+            const auto& item = runtime_propagator_stats_[hot];
+            absl::StrAppend(&hotspots, i == 0 ? "" : ";",
+                            hot, ":", runtime_propagator_names_[hot],
+                            " calls=", item.calls, " total_ns=", item.total_ns,
+                            " max_ns=", item.max_ns, " int=",
+                            item.integer_enqueues, " bool=",
+                            item.boolean_enqueues, " conflicts=", item.conflicts);
+          }
+          RuntimeProgressPrint(absl::StrCat(
+              "CP-SAT-RUNTIME event=PROPAGATOR_SUMMARY owner=",
+              runtime_owner_,
+              " branches=", runtime_sat_solver_->num_branches(),
+              " conflicts=", runtime_sat_solver_->num_failures(),
+              " propagations=", runtime_sat_solver_->num_propagations(),
+              " top=", hotspots, "\n"));
+          runtime_last_hotspot_publish_ns_ = now;
+        }
+      }
       if (!result) {
         id_to_watch_indices_[id].clear();
         in_queue_[id] = false;
@@ -2327,6 +2385,14 @@ void GenericLiteralWatcher::Untrail(const Trail& trail, int trail_index) {
 int GenericLiteralWatcher::Register(PropagatorInterface* propagator) {
   const int id = watchers_.size();
   watchers_.push_back(propagator);
+  if (runtime_diagnostics_) {
+#if defined(__cpp_rtti)
+    runtime_propagator_names_.push_back(typeid(*propagator).name());
+#else
+    LOG(FATAL) << "CP-SAT runtime diagnostics require C++ RTTI";
+#endif
+    runtime_propagator_stats_.push_back(RuntimePropagatorStats());
+  }
 
   id_need_reversible_support_.push_back(false);
   id_to_level_at_last_call_.push_back(0);

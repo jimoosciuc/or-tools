@@ -75,6 +75,7 @@
 #include "ortools/sat/presolve_context.h"
 #include "ortools/sat/presolve_util.h"
 #include "ortools/sat/probing.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_inprocessing.h"
 #include "ortools/sat/sat_parameters.pb.h"
@@ -7435,12 +7436,16 @@ void CpModelPresolver::ConvertToBoolAnd() {
 void CpModelPresolver::RunPropagatorsForConstraint(const ConstraintProto& ct) {
   if (context_->ModelIsUnsat()) return;
 
-  Model model;
+  Model model("presolve_single_constraint");
 
   // Enable as many propagators as possible. We do not care if some propagator
   // is a bit slow or if the explanation is too big: anything that improves our
   // bounds is an improvement.
   SatParameters local_params;
+  local_params.set_cp_sat_runtime_diagnostics(
+      context_->params().cp_sat_runtime_diagnostics());
+  local_params.set_cp_sat_runtime_diagnostics_period_seconds(
+      context_->params().cp_sat_runtime_diagnostics_period_seconds());
   local_params.set_use_try_edge_reasoning_in_no_overlap_2d(true);
   local_params.set_exploit_all_precedences(true);
   local_params.set_use_hard_precedences_in_cumulative(true);
@@ -7524,10 +7529,12 @@ void CpModelPresolver::RunPropagatorsForConstraint(const ConstraintProto& ct) {
 // TODO(user): It might make sense to run this in parallel. The same apply for
 // other expansive and self-contains steps like symmetry detection, etc...
 void CpModelPresolver::Probe() {
+  RuntimeProgressStage stage(context_->params().cp_sat_runtime_diagnostics(),
+                             "presolve", "Probe", "Probe");
   auto probing_timer =
       std::make_unique<PresolveTimer>(__FUNCTION__, logger_, time_limit_);
 
-  Model model;
+  Model model("presolve_probe");
   if (!LoadModelForProbing(context_, &model)) return;
 
   // Probe.
@@ -7879,6 +7886,9 @@ bool CpModelPresolver::PresolvePureSatPart() {
   // keep_all_feasible_solutions set to true.
   if (context_->ModelIsUnsat()) return true;
   if (context_->params().keep_all_feasible_solutions_in_presolve()) return true;
+  RuntimeProgressStage stage(context_->params().cp_sat_runtime_diagnostics(),
+                             "presolve", "PresolvePureSatPart",
+                             "PresolvePureSatPart");
 
   // Compute a dense re-indexing for the Booleans of the problem.
   int num_variables = 0;
@@ -12622,6 +12632,18 @@ void CpModelPresolver::PresolveToFixPoint() {
   if (time_limit_->LimitReached()) return;
   if (context_->ModelIsUnsat()) return;
   PresolveTimer timer(__FUNCTION__, logger_, time_limit_);
+  const bool runtime_diagnostics =
+      context_->params().cp_sat_runtime_diagnostics();
+  RuntimeProgressStage stage(runtime_diagnostics, "presolve",
+                             "PresolveToFixPoint", "constraint_queue");
+  const int64_t runtime_period_ns =
+      static_cast<int64_t>(context_->params()
+                               .cp_sat_runtime_diagnostics_period_seconds()) *
+      1'000'000'000;
+  int64_t last_runtime_log_ns = runtime_diagnostics
+                                    ? RuntimeProgressNowNanos()
+                                    : 0;
+  int64_t processed_constraints = 0;
 
   // We do at most 2 tests per PresolveToFixPoint() call since this can be slow.
   int num_dominance_tests = 0;
@@ -12707,6 +12729,22 @@ void CpModelPresolver::PresolveToFixPoint() {
       // just compare the number of applied "rules" before/after.
       if (changed) {
         context_->UpdateConstraintVariableUsage(c);
+      }
+      ++processed_constraints;
+      if (runtime_diagnostics) {
+        const int64_t now = RuntimeProgressNowNanos();
+        if (now - last_runtime_log_ns >= runtime_period_ns) {
+          RuntimeProgressPrint(absl::StrCat(
+              "CP-SAT-RUNTIME event=PROGRESS owner=presolve phase=fixpoint",
+              " processed_constraints=", processed_constraints,
+              " queued_constraints=", queue.size(), " loops=", num_loops,
+              " operations=", context_->num_presolve_operations,
+              " last_constraint=", c, " type=",
+              ConstraintCaseName(context_->working_model->constraints(c)
+                                     .constraint_case()),
+              " monotonic_ns=", now, "\n"));
+          last_runtime_log_ns = now;
+        }
       }
     }
 

@@ -1256,6 +1256,21 @@ class GenericLiteralWatcher final : public SatPropagator {
   util_intops::StrongVector<IntegerVariable, std::vector<WatchData>>
       var_to_watcher_;
   std::vector<PropagatorInterface*> watchers_;
+  bool runtime_diagnostics_ = false;
+  int runtime_diagnostics_period_seconds_ = 30;
+  std::string runtime_owner_;
+  struct RuntimePropagatorStats {
+    int64_t calls = 0;
+    int64_t total_ns = 0;
+    int64_t max_ns = 0;
+    int64_t integer_enqueues = 0;
+    int64_t boolean_enqueues = 0;
+    int64_t conflicts = 0;
+  };
+  std::vector<std::string> runtime_propagator_names_;
+  std::vector<RuntimePropagatorStats> runtime_propagator_stats_;
+  int64_t runtime_last_hotspot_publish_ns_ = 0;
+  SatSolver* runtime_sat_solver_ = nullptr;
   SparseBitset<IntegerVariable> modified_vars_;
 
   // For RegisterLevelZeroModifiedVariablesCallback().

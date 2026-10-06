@@ -77,6 +77,7 @@
 #include "ortools/sat/model.h"
 #include "ortools/sat/parameters_validation.h"
 #include "ortools/sat/presolve_context.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_inprocessing.h"
 #include "ortools/sat/sat_parameters.pb.h"
@@ -1037,6 +1038,7 @@ class FullProblemSolver : public SubSolver {
         shared_(shared),
         split_in_chunks_(split_in_chunks),
         stop_at_first_solution_(stop_at_first_solution),
+        runtime_diagnostics_(local_parameters.cp_sat_runtime_diagnostics()),
         local_model_(SubSolver::name()) {
     // Setup the local model parameters and time limit.
     *(local_model_.GetOrCreate<SatParameters>()) = local_parameters;
@@ -1104,7 +1106,11 @@ class FullProblemSolver : public SubSolver {
     }
     return [this]() {
       if (solving_first_chunk_) {
-        LoadCpModel(shared_->model_proto, &local_model_);
+        {
+          RuntimeProgressStage stage(runtime_diagnostics_, std::string(name()),
+                                     "worker_initialization", "load_model");
+          LoadCpModel(shared_->model_proto, &local_model_);
+        }
 
         // Level zero variable bounds sharing. It is important to register
         // that after the probing that takes place in LoadCpModel() otherwise
@@ -1134,10 +1140,14 @@ class FullProblemSolver : public SubSolver {
                                "Starting subsolver \'%s\' hint search at %.2fs",
                                name(), shared_->wall_timer->Get()));
 
-        if (local_model_.GetOrCreate<SatParameters>()->repair_hint()) {
-          MinimizeL1DistanceWithHint(shared_->model_proto, &local_model_);
-        } else {
-          QuickSolveWithHint(shared_->model_proto, &local_model_);
+        {
+          RuntimeProgressStage stage(runtime_diagnostics_, std::string(name()),
+                                     "worker_initialization", "hint");
+          if (local_model_.GetOrCreate<SatParameters>()->repair_hint()) {
+            MinimizeL1DistanceWithHint(shared_->model_proto, &local_model_);
+          } else {
+            QuickSolveWithHint(shared_->model_proto, &local_model_);
+          }
         }
 
         SOLVER_LOG(logger,
@@ -1166,7 +1176,19 @@ class FullProblemSolver : public SubSolver {
       }
 
       const double saved_dtime = time_limit->GetElapsedDeterministicTime();
-      SolveLoadedCpModel(shared_->model_proto, &local_model_);
+      {
+        RuntimeProgressStage stage(runtime_diagnostics_, std::string(name()),
+                                   "worker_search", "SolveLoadedCpModel");
+        SolveLoadedCpModel(shared_->model_proto, &local_model_);
+      }
+      if (runtime_diagnostics_) {
+        const SatSolver* solver = local_model_.Get<SatSolver>();
+        RuntimeProgressPrint(absl::StrCat(
+            "CP-SAT-RUNTIME event=WORKER_SEARCH_STATS owner=", name(),
+            " branches=", solver->num_branches(),
+            " conflicts=", solver->num_failures(),
+            " propagations=", solver->num_propagations(), "\n"));
+      }
 
       absl::MutexLock mutex_lock(&mutex_);
       previous_task_is_completed_ = true;
@@ -1189,6 +1211,7 @@ class FullProblemSolver : public SubSolver {
   SharedClasses* shared_;
   const bool split_in_chunks_;
   const bool stop_at_first_solution_;
+  const bool runtime_diagnostics_;
   Model local_model_;
 
   // The first chunk is special. It is the one in which we load the model and
@@ -2435,6 +2458,8 @@ CpSolverResponse SolveCpModel(const CpModelProto& model_proto, Model* model) {
   // Validate model_proto.
   // TODO(user): provide an option to skip this step for speed?
   {
+    RuntimeProgressStage stage(params.cp_sat_runtime_diagnostics(), "root",
+                               "model_validation", "ValidateInputCpModel");
     const std::string error = ValidateInputCpModel(params, model_proto);
     if (!error.empty()) {
       SOLVER_LOG(logger, "Invalid model: ", error);
@@ -2463,20 +2488,25 @@ CpSolverResponse SolveCpModel(const CpModelProto& model_proto, Model* model) {
       google::protobuf::Arena::Create<CpModelProto>(&arena);
   CpModelProto* mapping_proto =
       google::protobuf::Arena::Create<CpModelProto>(&arena);
-  auto context = std::make_unique<PresolveContext>(model, new_cp_model_proto,
-                                                   mapping_proto);
+  std::unique_ptr<PresolveContext> context;
+  {
+    RuntimeProgressStage stage(params.cp_sat_runtime_diagnostics(), "root",
+                               "model_import", "ImportModelWithBasicPresolve");
+    context = std::make_unique<PresolveContext>(model, new_cp_model_proto,
+                                                mapping_proto);
 
-  if (absl::GetFlag(FLAGS_debug_model_copy)) {
-    *new_cp_model_proto = model_proto;
-  } else if (!ImportModelWithBasicPresolveIntoContext(model_proto,
-                                                      context.get())) {
-    const std::string info = "Problem proven infeasible during initial copy.";
-    SOLVER_LOG(logger, info);
-    CpSolverResponse status_response;
-    status_response.set_status(CpSolverStatus::INFEASIBLE);
-    status_response.set_solution_info(info);
-    shared_response_manager->AppendResponseToBeMerged(status_response);
-    return shared_response_manager->GetResponse();
+    if (absl::GetFlag(FLAGS_debug_model_copy)) {
+      *new_cp_model_proto = model_proto;
+    } else if (!ImportModelWithBasicPresolveIntoContext(model_proto,
+                                                        context.get())) {
+      const std::string info = "Problem proven infeasible during initial copy.";
+      SOLVER_LOG(logger, info);
+      CpSolverResponse status_response;
+      status_response.set_status(CpSolverStatus::INFEASIBLE);
+      status_response.set_solution_info(info);
+      shared_response_manager->AppendResponseToBeMerged(status_response);
+      return shared_response_manager->GetResponse();
+    }
   }
 
   if (context->working_model->has_symmetry()) {
@@ -2654,8 +2684,12 @@ CpSolverResponse SolveCpModel(const CpModelProto& model_proto, Model* model) {
 
   // Do the actual presolve.
   std::vector<int> postsolve_mapping;
-  const CpSolverStatus presolve_status =
-      PresolveCpModel(context.get(), &postsolve_mapping);
+  CpSolverStatus presolve_status;
+  {
+    RuntimeProgressStage stage(params.cp_sat_runtime_diagnostics(), "root",
+                               "presolve", "PresolveCpModel");
+    presolve_status = PresolveCpModel(context.get(), &postsolve_mapping);
+  }
 
   // Delete the context as soon as the presolve is done. Note that only
   // postsolve_mapping and mapping_proto are needed for postsolve.

@@ -42,6 +42,15 @@ cc_library(
 )
 
 cc_library(
+    name = "runtime_progress",
+    srcs = ["runtime_progress.cc"],
+    hdrs = ["runtime_progress.h"],
+    deps = [
+        "@com_google_absl//absl/strings",
+    ],
+)
+
+cc_library(
     name = "model",
     hdrs = ["model.h"],
     deps = [
@@ -582,6 +591,7 @@ cc_library(
     srcs = ["cp_model_solver.cc"],
     hdrs = ["cp_model_solver.h"],
     deps = [
+        ":runtime_progress",
         ":circuit",
         ":clause",
         ":combine_solutions",
@@ -954,6 +964,7 @@ cc_library(
         ":model",
         ":presolve_context",
         ":presolve_util",
+        ":runtime_progress",
         ":probing",
         ":sat_base",
         ":sat_inprocessing",
@@ -1584,6 +1595,7 @@ cc_library(
     srcs = ["integer.cc"],
     hdrs = ["integer.h"],
     deps = [
+        ":runtime_progress",
         ":integer_base",
         ":model",
         ":sat_base",
