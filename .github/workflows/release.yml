@@ -37,9 +37,11 @@ jobs:
           { name: "cpp",       lang: "cpp" },
           { name: "dotnet",    lang: "dotnet" },
           { name: "java",      lang: "java" },
-          #{ name: "python310", lang: "python", python_version: "10" },
+          { name: "python310", lang: "python", python_version: "10" },
+          { name: "python311", lang: "python", python_version: "11" },
           { name: "python312", lang: "python", python_version: "12" },
-          #{ name: "python314", lang: "python", python_version: "14" }
+          { name: "python313", lang: "python", python_version: "13" },
+          { name: "python314", lang: "python", python_version: "14" }
         ]
     name: Build(${{matrix.platform.arch}}•${{matrix.platform.os}}•${{matrix.target.name}})
     runs-on: ${{matrix.platform.runner}}
@@ -177,9 +179,11 @@ jobs:
           { name: "cpp",       lang: "cpp" },
           { name: "dotnet",    lang: "dotnet" },
           { name: "java",      lang: "java" },
-          #{ name: "python310", lang: "python", python_version: "10" },
+          { name: "python310", lang: "python", python_version: "10" },
+          { name: "python311", lang: "python", python_version: "11" },
           { name: "python312", lang: "python", python_version: "12" },
-          #{ name: "python314", lang: "python", python_version: "14" }
+          { name: "python313", lang: "python", python_version: "13" },
+          { name: "python314", lang: "python", python_version: "14" }
         ]
     name: Test(${{matrix.platform.arch}}•${{matrix.platform.os}}•${{matrix.target.name}})
     runs-on: ${{matrix.platform.runner}}
@@ -345,11 +349,11 @@ jobs:
       fail-fast: false
       matrix:
         platform: [
-          { runner: "ubuntu-22.04",     arch: "amd64", os: "linux",   generator: "Ninja" },
-          { runner: "ubuntu-22.04-arm", arch: "arm64", os: "linux",   generator: "Ninja" },
-          { runner: "macos-15-intel",   arch: "amd64", os: "macos",   generator: "Ninja" },
-          { runner: "macos-latest",     arch: "arm64", os: "macos",   generator: "Ninja" },
-          { runner: "windows-latest",   arch: "amd64", os: "windows", generator: "Visual Studio 18 2026" }
+          { runner: "ubuntu-22.04",     arch: "amd64", os: "linux" },
+          { runner: "ubuntu-22.04-arm", arch: "arm64", os: "linux" },
+          { runner: "macos-15-intel",   arch: "amd64", os: "macos" },
+          { runner: "macos-latest",     arch: "arm64", os: "macos" },
+          { runner: "windows-latest",   arch: "amd64", os: "windows" }
         ]
         target: [
           { name: "dotnet", lang: "dotnet" },
@@ -436,18 +440,18 @@ jobs:
         arch: [amd64]
         os: [
           almalinux-10,
-          #alpine-edge,
-          #archlinux,
-          #debian-sid,
-          #debian-13,
-          #debian-12,
-          #fedora-44,
-          #fedora-43,
-          #opensuse-leap,
-          #rockylinux-10,
+          alpine-edge,
+          archlinux,
+          debian-sid,
+          debian-13,
+          debian-12,
+          fedora-44,
+          fedora-43,
+          opensuse-leap,
+          rockylinux-10,
           ubuntu-26.04,
-          #ubuntu-24.04,
-          #ubuntu-22.04,
+          ubuntu-24.04,
+          ubuntu-22.04,
         ]
         lang: [cpp, dotnet, java, python]
     name: Distro(${{matrix.arch}}•${{matrix.os}}•${{matrix.lang}})
@@ -487,9 +491,9 @@ jobs:
         distro: [manylinux, musllinux]
         python: [
           310,
-          #311,
+          311,
           312,
-          #313,
+          313,
           314
         ]
     name: Python(${{matrix.arch}}•${{matrix.distro}}•cp${{matrix.python}})
