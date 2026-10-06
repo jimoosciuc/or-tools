@@ -12644,6 +12644,10 @@ void CpModelPresolver::PresolveToFixPoint() {
                                     ? RuntimeProgressNowNanos()
                                     : 0;
   int64_t processed_constraints = 0;
+  const bool rule_stats_available =
+      runtime_diagnostics && context_->logger()->LoggingIsEnabled();
+  absl::flat_hash_map<std::string, int> previous_rule_stats;
+  if (rule_stats_available) previous_rule_stats = context_->rule_stats();
 
   // We do at most 2 tests per PresolveToFixPoint() call since this can be slow.
   int num_dominance_tests = 0;
@@ -12734,16 +12738,49 @@ void CpModelPresolver::PresolveToFixPoint() {
       if (runtime_diagnostics) {
         const int64_t now = RuntimeProgressNowNanos();
         if (now - last_runtime_log_ns >= runtime_period_ns) {
+          const int64_t period_ns = now - last_runtime_log_ns;
+          std::vector<std::tuple<int64_t, std::string, int>> rule_deltas;
+          if (rule_stats_available) {
+            for (const auto& [name, total] : context_->rule_stats()) {
+              const int64_t delta = static_cast<int64_t>(total) -
+                                    previous_rule_stats[name];
+              if (delta > 0) rule_deltas.emplace_back(delta, name, total);
+            }
+            std::sort(rule_deltas.begin(), rule_deltas.end(),
+                      [](const auto& a, const auto& b) {
+                        return std::get<0>(a) > std::get<0>(b) ||
+                               (std::get<0>(a) == std::get<0>(b) &&
+                                std::get<1>(a) < std::get<1>(b));
+                      });
+            if (rule_deltas.size() > 5) rule_deltas.resize(5);
+          }
+          std::string rule_summary;
+          if (!rule_stats_available) {
+            rule_summary = " rule_stats=unavailable_logger_disabled";
+          } else {
+            rule_summary = " rule_stats_delta_top5=";
+            if (rule_deltas.empty()) rule_summary += "none";
+            for (const auto& [delta, name, total] : rule_deltas) {
+              absl::StrAppend(&rule_summary, "[", name, "|delta=", delta,
+                              "|total=", total, "]");
+            }
+            rule_summary += " rule_stats_include_TODO=true";
+            rule_summary += " operations_exclude_TODO=true";
+          }
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=PROGRESS owner=presolve phase=fixpoint",
               " processed_constraints=", processed_constraints,
               " queued_constraints=", queue.size(), " loops=", num_loops,
               " operations=", context_->num_presolve_operations,
+              " rule_stats_period_ns=", period_ns, rule_summary,
               " last_constraint=", c, " type=",
               ConstraintCaseName(context_->working_model->constraints(c)
                                      .constraint_case()),
               " monotonic_ns=", now, "\n"));
           last_runtime_log_ns = now;
+          if (rule_stats_available) {
+            previous_rule_stats = context_->rule_stats();
+          }
         }
       }
     }

@@ -637,6 +637,9 @@ class PresolveContext {
 
   SolverLogger* logger() const { return logger_; }
   const SatParameters& params() const { return params_; }
+  const absl::flat_hash_map<std::string, int>& rule_stats() const {
+    return stats_by_rule_name_;
+  }
   TimeLimit* time_limit() { return time_limit_; }
   ModelRandomGenerator* random() { return random_; }
 
