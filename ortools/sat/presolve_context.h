@@ -102,6 +102,8 @@ class PresolveContext {
     int64_t first_max = 0;
     int64_t last_min = 0;
     int64_t last_max = 0;
+    int last_source_id = -1;
+    int last_source_type = 0;
   };
   using RuntimeDomainChanges = absl::flat_hash_map<int, RuntimeDomainChange>;
 
@@ -656,6 +658,16 @@ class PresolveContext {
   const RuntimeDomainChanges& runtime_domain_changes() const {
     return runtime_domain_changes_;
   }
+  int runtime_domain_change_source_id() const {
+    return runtime_domain_change_source_id_;
+  }
+  int runtime_domain_change_source_type() const {
+    return runtime_domain_change_source_type_;
+  }
+  void SetRuntimeDomainChangeSource(int id, int type) {
+    runtime_domain_change_source_id_ = id;
+    runtime_domain_change_source_type_ = type;
+  }
   // Keep the backing array for reuse by the next reporting period.
   void ClearRuntimeDomainChangesForNextPeriod() {
     runtime_domain_changes_.erase(runtime_domain_changes_.begin(),
@@ -811,6 +823,8 @@ class PresolveContext {
   absl::flat_hash_map<std::string, int> stats_by_rule_name_;
   bool collecting_runtime_domain_changes_ = false;
   RuntimeDomainChanges runtime_domain_changes_;
+  int runtime_domain_change_source_id_ = -1;
+  int runtime_domain_change_source_type_ = 0;
 
   // Used by CanonicalizeLinearExpressionInternal().
   std::vector<std::pair<int, int64_t>> tmp_terms_;

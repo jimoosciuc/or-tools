@@ -12650,6 +12650,18 @@ void CpModelPresolver::PresolveToFixPoint() {
                                     ? RuntimeProgressNowNanos()
                                     : 0;
   int64_t processed_constraints = 0;
+  struct ConstraintTypeRuntimeStats {
+    int64_t calls = 0;
+    int64_t samples = 0;
+    int64_t sample_ns = 0;
+    int64_t max_sample_ns = 0;
+    int max_sample_constraint = -1;
+  };
+  // kDummyConstraint is currently the highest ConstraintProto oneof field.
+  std::optional<std::array<ConstraintTypeRuntimeStats,
+                            ConstraintProto::kDummyConstraint + 1>>
+      constraint_type_stats;
+  if (runtime_diagnostics) constraint_type_stats.emplace();
   const bool rule_stats_available =
       runtime_diagnostics && context_->logger()->LoggingIsEnabled();
   absl::flat_hash_map<std::string, int> previous_rule_stats;
@@ -12716,7 +12728,41 @@ void CpModelPresolver::PresolveToFixPoint() {
 
       const int old_num_constraint =
           context_->working_model->constraints_size();
+      int source_type_index = 0;
+      ConstraintTypeRuntimeStats* type_stats = nullptr;
+      bool sample_constraint = false;
+      int old_source_id = -1;
+      int old_source_type = 0;
+      if (runtime_diagnostics) {
+        source_type_index = static_cast<int>(
+            context_->working_model->constraints(c).constraint_case());
+        CHECK_GE(source_type_index, 0);
+        CHECK_LT(source_type_index,
+                 static_cast<int>(constraint_type_stats->size()));
+        type_stats = &(*constraint_type_stats)[source_type_index];
+        sample_constraint = (++type_stats->calls % 1024 == 0);
+        old_source_id = context_->runtime_domain_change_source_id();
+        old_source_type = context_->runtime_domain_change_source_type();
+        context_->SetRuntimeDomainChangeSource(c, source_type_index);
+      }
+      const int64_t sample_start_ns =
+          sample_constraint ? RuntimeProgressNowNanos() : 0;
       const bool changed = PresolveOneConstraint(c);
+      const int64_t sample_end_ns =
+          sample_constraint ? RuntimeProgressNowNanos() : 0;
+      if (runtime_diagnostics) {
+        context_->SetRuntimeDomainChangeSource(old_source_id,
+                                               old_source_type);
+      }
+      if (sample_constraint) {
+        const int64_t elapsed_ns = sample_end_ns - sample_start_ns;
+        ++type_stats->samples;
+        type_stats->sample_ns += elapsed_ns;
+        if (elapsed_ns > type_stats->max_sample_ns) {
+          type_stats->max_sample_ns = elapsed_ns;
+          type_stats->max_sample_constraint = c;
+        }
+      }
       if (context_->ModelIsUnsat()) {
         SOLVER_LOG(
             logger_, "Unsat after presolving constraint #", c,
@@ -12803,9 +12849,97 @@ void CpModelPresolver::PresolveToFixPoint() {
                             "\",nonempty_domain_updates=", count,
                             ",first_range=[", stats.first_min, ",",
                             stats.first_max, "],last_range=[", stats.last_min,
-                            ",", stats.last_max, "],range_summary=min_max]");
+                            ",", stats.last_max, "],range_summary=min_max",
+                            ",last_source_scope=",
+                            stats.last_source_id < 0 ? "non_constraint"
+                                                     : "queue_one_constraint",
+                            ",last_source_id=", stats.last_source_id,
+                            ",last_source_type=",
+                            stats.last_source_id < 0
+                                ? "non_constraint"
+                                : ConstraintCaseName(static_cast<
+                                      ConstraintProto::ConstraintCase>(
+                                      stats.last_source_type)),
+                            "]");
           }
           if (!has_domain_change) domain_summary += "none";
+          std::string type_sample_summary = " constraint_type_samples=";
+          bool has_type_calls = false;
+          for (int type = 0;
+               type < static_cast<int>(constraint_type_stats->size()); ++type) {
+            const auto& stats = (*constraint_type_stats)[type];
+            if (stats.calls == 0) continue;
+            has_type_calls = true;
+            absl::StrAppend(&type_sample_summary, "[type=",
+                            ConstraintCaseName(static_cast<
+                                ConstraintProto::ConstraintCase>(type)),
+                            ",calls=", stats.calls, ",sample_every=1024",
+                            ",samples=", stats.samples,
+                            ",sampled_wall_ns=", stats.sample_ns,
+                            ",max_sampled_wall_ns=", stats.max_sample_ns,
+                            ",max_sample_id=", stats.max_sample_constraint,
+                            "]");
+          }
+          if (!has_type_calls) type_sample_summary += "none";
+          std::string source_constraint_summary = " source_constraints=";
+          std::array<int, 5> source_ids{};
+          std::array<int, 5> source_types{};
+          source_ids.fill(-1);
+          int source_count = 0;
+          for (const auto& [count, id] : domain_top) {
+            if (count == 0) continue;
+            const auto& domain_stats = domain_changes.at(id);
+            const int source_id = domain_stats.last_source_id;
+            if (source_id < 0 ||
+                std::find(source_ids.begin(), source_ids.begin() + source_count,
+                          source_id) != source_ids.begin() + source_count) {
+              continue;
+            }
+            source_ids[source_count++] = source_id;
+            source_types[source_count - 1] = domain_stats.last_source_type;
+          }
+          if (source_count == 0) {
+            source_constraint_summary += "none";
+          } else {
+            for (int i = 0; i < source_count; ++i) {
+              const int id = source_ids[i];
+              if (id >= context_->working_model->constraints_size() ||
+                  context_->working_model->constraints(id).constraint_case() ==
+                      ConstraintProto::CONSTRAINT_NOT_SET) {
+                absl::StrAppend(&source_constraint_summary, "[id=", id,
+                                ",current_proto=removed]");
+                continue;
+              }
+              const ConstraintProto& source =
+                  context_->working_model->constraints(id);
+              std::string current = ProtobufShortDebugString(source);
+              constexpr int kMaxCurrentProtoSummary = 384;
+              const bool truncated = current.size() > kMaxCurrentProtoSummary;
+              if (truncated) current.resize(kMaxCurrentProtoSummary);
+              const auto source_vars = context_->ConstraintToVars(id);
+              absl::StrAppend(&source_constraint_summary,
+                              "[id=", id, ",source_type_at_call=",
+                              ConstraintCaseName(static_cast<
+                                  ConstraintProto::ConstraintCase>(
+                                  source_types[i])), ",current_type=",
+                              ConstraintCaseName(source.constraint_case()),
+                              ",current_proto=\"", absl::CEscape(current),
+                              truncated ? "...truncated" : "",
+                              "\",current_refs=");
+              const size_t refs_to_print = std::min<size_t>(6, source_vars.size());
+              for (size_t ref = 0; ref < refs_to_print; ++ref) {
+                const int var = source_vars[ref];
+                absl::StrAppend(&source_constraint_summary, "[", var, ":\"",
+                                absl::CEscape(
+                                    context_->working_model->variables(var)
+                                        .name()),
+                                "\"]");
+              }
+              absl::StrAppend(&source_constraint_summary,
+                              ",current_refs_truncated=",
+                              source_vars.size() > refs_to_print, "]");
+            }
+          }
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=PROGRESS owner=presolve phase=fixpoint",
               " processed_constraints=", processed_constraints,
@@ -12815,7 +12949,9 @@ void CpModelPresolver::PresolveToFixPoint() {
               " model_constraints=",
               context_->working_model->constraints_size(),
               " rule_stats_period_ns=", period_ns, rule_summary,
-              domain_summary,
+              domain_summary, type_sample_summary,
+              " sample_time_scope=PresolveOneConstraint_wall",
+              source_constraint_summary,
               " last_constraint=", c, " type=",
               ConstraintCaseName(context_->working_model->constraints(c)
                                      .constraint_case()),
@@ -12824,6 +12960,7 @@ void CpModelPresolver::PresolveToFixPoint() {
           if (rule_stats_available) {
             previous_rule_stats = context_->rule_stats();
           }
+          constraint_type_stats->fill(ConstraintTypeRuntimeStats{});
           context_->ClearRuntimeDomainChangesForNextPeriod();
         }
       }

@@ -74,11 +74,15 @@ void PresolveContext::ClearStats() { stats_by_rule_name_.clear(); }
 void PresolveContext::BeginRuntimeDomainChangeCollection() {
   collecting_runtime_domain_changes_ = params_.cp_sat_runtime_diagnostics();
   runtime_domain_changes_.clear();
+  runtime_domain_change_source_id_ = -1;
+  runtime_domain_change_source_type_ = 0;
 }
 
 void PresolveContext::EndRuntimeDomainChangeCollection() {
   collecting_runtime_domain_changes_ = false;
   runtime_domain_changes_.clear();
+  runtime_domain_change_source_id_ = -1;
+  runtime_domain_change_source_type_ = 0;
 }
 
 void PresolveContext::RecordRuntimeDomainChange(int var, int64_t old_min,
@@ -93,6 +97,8 @@ void PresolveContext::RecordRuntimeDomainChange(int var, int64_t old_min,
   ++stats.count;
   stats.last_min = new_min;
   stats.last_max = new_max;
+  stats.last_source_id = runtime_domain_change_source_id_;
+  stats.last_source_type = runtime_domain_change_source_type_;
 }
 
 int PresolveContext::NewIntVar(const Domain& domain) {
