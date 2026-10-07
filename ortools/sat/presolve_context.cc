@@ -76,6 +76,9 @@ void PresolveContext::BeginRuntimeDomainChangeCollection() {
   runtime_domain_changes_.clear();
   runtime_domain_change_source_id_ = -1;
   runtime_domain_change_source_type_ = 0;
+  runtime_domain_change_source_two_var_diff_ = false;
+  runtime_domain_change_intersections_ = 0;
+  runtime_domain_change_two_var_diff_intersections_ = 0;
 }
 
 void PresolveContext::EndRuntimeDomainChangeCollection() {
@@ -83,6 +86,7 @@ void PresolveContext::EndRuntimeDomainChangeCollection() {
   runtime_domain_changes_.clear();
   runtime_domain_change_source_id_ = -1;
   runtime_domain_change_source_type_ = 0;
+  runtime_domain_change_source_two_var_diff_ = false;
 }
 
 void PresolveContext::RecordRuntimeDomainChange(int var, int64_t old_min,
@@ -99,6 +103,11 @@ void PresolveContext::RecordRuntimeDomainChange(int var, int64_t old_min,
   stats.last_max = new_max;
   stats.last_source_id = runtime_domain_change_source_id_;
   stats.last_source_type = runtime_domain_change_source_type_;
+  stats.last_source_two_var_diff = runtime_domain_change_source_two_var_diff_;
+  ++runtime_domain_change_intersections_;
+  if (runtime_domain_change_source_two_var_diff_) {
+    ++runtime_domain_change_two_var_diff_intersections_;
+  }
 }
 
 int PresolveContext::NewIntVar(const Domain& domain) {

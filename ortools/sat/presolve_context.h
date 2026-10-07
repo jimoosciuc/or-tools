@@ -104,6 +104,7 @@ class PresolveContext {
     int64_t last_max = 0;
     int last_source_id = -1;
     int last_source_type = 0;
+    bool last_source_two_var_diff = false;
   };
   using RuntimeDomainChanges = absl::flat_hash_map<int, RuntimeDomainChange>;
 
@@ -664,9 +665,20 @@ class PresolveContext {
   int runtime_domain_change_source_type() const {
     return runtime_domain_change_source_type_;
   }
-  void SetRuntimeDomainChangeSource(int id, int type) {
+  bool runtime_domain_change_source_two_var_diff() const {
+    return runtime_domain_change_source_two_var_diff_;
+  }
+  int64_t runtime_domain_change_intersections() const {
+    return runtime_domain_change_intersections_;
+  }
+  int64_t runtime_domain_change_two_var_diff_intersections() const {
+    return runtime_domain_change_two_var_diff_intersections_;
+  }
+  void SetRuntimeDomainChangeSource(int id, int type,
+                                    bool two_var_diff = false) {
     runtime_domain_change_source_id_ = id;
     runtime_domain_change_source_type_ = type;
+    runtime_domain_change_source_two_var_diff_ = two_var_diff;
   }
   // Keep the backing array for reuse by the next reporting period.
   void ClearRuntimeDomainChangesForNextPeriod() {
@@ -825,6 +837,9 @@ class PresolveContext {
   RuntimeDomainChanges runtime_domain_changes_;
   int runtime_domain_change_source_id_ = -1;
   int runtime_domain_change_source_type_ = 0;
+  bool runtime_domain_change_source_two_var_diff_ = false;
+  int64_t runtime_domain_change_intersections_ = 0;
+  int64_t runtime_domain_change_two_var_diff_intersections_ = 0;
 
   // Used by CanonicalizeLinearExpressionInternal().
   std::vector<std::pair<int, int64_t>> tmp_terms_;

@@ -12654,6 +12654,45 @@ void CpModelPresolver::PresolveToFixPoint() {
       1'000'000'000;
   int64_t last_runtime_log_ns = pfp_id;
   int64_t last_phase_summary_ns = pfp_id;
+  struct TwoVarDiffSample {
+    int constraint;
+    int var0;
+    int var1;
+    int64_t coeff0;
+    int64_t coeff1;
+    int64_t domain_min;
+    int64_t domain_max;
+  };
+  std::optional<std::array<TwoVarDiffSample, 16>> two_var_diff_samples;
+  if (runtime_diagnostics) two_var_diff_samples.emplace();
+  int two_var_diff_sample_count = 0;
+  int64_t input_nonempty_constraints = 0;
+  int64_t input_linear_constraints = 0;
+  int64_t input_two_var_diff_constraints = 0;
+  int64_t processed_constraints = 0;
+  int64_t processed_two_var_diff_constraints = 0;
+  bool input_samples_emitted = false;
+  const auto is_two_var_diff_candidate = [](const ConstraintProto& ct) {
+    if (ct.constraint_case() != ConstraintProto::kLinear ||
+        ct.enforcement_literal_size() != 0) {
+      return false;
+    }
+    const LinearConstraintProto& linear = ct.linear();
+    if (linear.vars_size() != 2 || linear.coeffs_size() != 2 ||
+        linear.domain_size() != 2 || linear.domain(0) > linear.domain(1)) {
+      return false;
+    }
+    if (PositiveRef(linear.vars(0)) == PositiveRef(linear.vars(1))) {
+      return false;
+    }
+    const int64_t coeff0 = linear.coeffs(0);
+    const int64_t coeff1 = linear.coeffs(1);
+    if (coeff0 == 0 || coeff1 == 0) return false;
+    return coeff0 == coeff1 ||
+           (coeff0 != std::numeric_limits<int64_t>::min() &&
+            coeff1 != std::numeric_limits<int64_t>::min() &&
+            coeff0 == -coeff1);
+  };
   enum PfpPhase {
     kQueueInitializeSort,
     kQueueDrainBatch,
@@ -12705,6 +12744,8 @@ void CpModelPresolver::PresolveToFixPoint() {
   auto emit_phase_summary = [&](int64_t now, const char* boundary,
                                 bool queue_batch_active) {
     if (!runtime_diagnostics) return;
+    const bool emit_input_samples = !input_samples_emitted;
+    input_samples_emitted = true;
     int64_t accounted_wall_ns = 0;
     std::string phase_summary;
     for (int i = 0; i < kPfpPhaseCount; ++i) {
@@ -12727,7 +12768,30 @@ void CpModelPresolver::PresolveToFixPoint() {
         " queue_batch_includes_progress_format_and_print=true",
         " accounted_phase_wall_ns=", accounted_wall_ns,
         " unattributed_wall_ns=", now - pfp_id - accounted_wall_ns,
+        " two_var_diff_input_nonempty=", input_nonempty_constraints,
+        " two_var_diff_input_linear=", input_linear_constraints,
+        " two_var_diff_input_candidates=", input_two_var_diff_constraints,
+        " queue_constraint_calls=", processed_constraints,
+        " queue_two_var_diff_candidate_calls=",
+        processed_two_var_diff_constraints,
+        " pfp_nonempty_domain_intersections_cumulative=",
+        context_->runtime_domain_change_intersections(),
+        " pfp_candidate_source_nonempty_domain_intersections_cumulative=",
+        context_->runtime_domain_change_two_var_diff_intersections(),
+        " two_var_diff_input_sample_count=", two_var_diff_sample_count,
+        " two_var_diff_input_samples_emitted=", emit_input_samples,
         " phases=", phase_summary, "\n"));
+    if (emit_input_samples) {
+      for (int i = 0; i < two_var_diff_sample_count; ++i) {
+        const TwoVarDiffSample& sample = (*two_var_diff_samples)[i];
+        RuntimeProgressPrint(absl::StrCat(
+            "CP-SAT-RUNTIME event=PFP_DIFF_SAMPLE pfp_id=", pfp_id,
+            " constraint_index=", sample.constraint, " var_refs=[",
+            sample.var0, ",", sample.var1, "] coeffs=[", sample.coeff0, ",",
+            sample.coeff1, "] domain=[", sample.domain_min, ",",
+            sample.domain_max, "]\n"));
+      }
+    }
     previous_pfp_phase_stats = pfp_phase_stats;
     last_phase_summary_ns = now;
   };
@@ -12737,7 +12801,6 @@ void CpModelPresolver::PresolveToFixPoint() {
                          /*queue_batch_active=*/false);
     }
   };
-  int64_t processed_constraints = 0;
   struct ConstraintTypeRuntimeStats {
     int64_t calls = 0;
     int64_t samples = 0;
@@ -12776,10 +12839,23 @@ void CpModelPresolver::PresolveToFixPoint() {
                              false);
   std::deque<int> queue;
   for (int c = 0; c < in_queue.size(); ++c) {
-    if (context_->working_model->constraints(c).constraint_case() !=
-        ConstraintProto::CONSTRAINT_NOT_SET) {
-      in_queue[c] = true;
-      queue.push_back(c);
+    const ConstraintProto& ct = context_->working_model->constraints(c);
+    if (ct.constraint_case() == ConstraintProto::CONSTRAINT_NOT_SET) continue;
+    in_queue[c] = true;
+    queue.push_back(c);
+    if (!runtime_diagnostics) continue;
+    ++input_nonempty_constraints;
+    if (ct.constraint_case() == ConstraintProto::kLinear) {
+      ++input_linear_constraints;
+    }
+    if (!is_two_var_diff_candidate(ct)) continue;
+    ++input_two_var_diff_constraints;
+    if (two_var_diff_sample_count <
+        static_cast<int>(two_var_diff_samples->size())) {
+      const LinearConstraintProto& linear = ct.linear();
+      (*two_var_diff_samples)[two_var_diff_sample_count++] = {
+          c, linear.vars(0), linear.vars(1), linear.coeffs(0),
+          linear.coeffs(1), linear.domain(0), linear.domain(1)};
     }
   }
 
@@ -12828,11 +12904,15 @@ void CpModelPresolver::PresolveToFixPoint() {
       int source_type_index = 0;
       ConstraintTypeRuntimeStats* type_stats = nullptr;
       bool sample_constraint = false;
+      bool two_var_diff_candidate = false;
       int old_source_id = -1;
       int old_source_type = 0;
+      bool old_source_two_var_diff = false;
       if (runtime_diagnostics) {
-        source_type_index = static_cast<int>(
-            context_->working_model->constraints(c).constraint_case());
+        const ConstraintProto& ct = context_->working_model->constraints(c);
+        source_type_index = static_cast<int>(ct.constraint_case());
+        two_var_diff_candidate = is_two_var_diff_candidate(ct);
+        if (two_var_diff_candidate) ++processed_two_var_diff_constraints;
         CHECK_GE(source_type_index, 0);
         CHECK_LT(source_type_index,
                  static_cast<int>(constraint_type_stats->size()));
@@ -12840,7 +12920,10 @@ void CpModelPresolver::PresolveToFixPoint() {
         sample_constraint = (++type_stats->calls % 1024 == 0);
         old_source_id = context_->runtime_domain_change_source_id();
         old_source_type = context_->runtime_domain_change_source_type();
-        context_->SetRuntimeDomainChangeSource(c, source_type_index);
+        old_source_two_var_diff =
+            context_->runtime_domain_change_source_two_var_diff();
+        context_->SetRuntimeDomainChangeSource(
+            c, source_type_index, two_var_diff_candidate);
       }
       const int64_t sample_start_ns =
           sample_constraint ? RuntimeProgressNowNanos() : 0;
@@ -12849,7 +12932,8 @@ void CpModelPresolver::PresolveToFixPoint() {
           sample_constraint ? RuntimeProgressNowNanos() : 0;
       if (runtime_diagnostics) {
         context_->SetRuntimeDomainChangeSource(old_source_id,
-                                               old_source_type);
+                                               old_source_type,
+                                               old_source_two_var_diff);
       }
       if (sample_constraint) {
         const int64_t elapsed_ns = sample_end_ns - sample_start_ns;
@@ -12981,6 +13065,7 @@ void CpModelPresolver::PresolveToFixPoint() {
           std::string source_constraint_summary = " source_constraints=";
           std::array<int, 5> source_ids{};
           std::array<int, 5> source_types{};
+          std::array<bool, 5> source_two_var_diff{};
           source_ids.fill(-1);
           int source_count = 0;
           for (const auto& [count, id] : domain_top) {
@@ -12994,6 +13079,8 @@ void CpModelPresolver::PresolveToFixPoint() {
             }
             source_ids[source_count++] = source_id;
             source_types[source_count - 1] = domain_stats.last_source_type;
+            source_two_var_diff[source_count - 1] =
+                domain_stats.last_source_two_var_diff;
           }
           if (source_count == 0) {
             source_constraint_summary += "none";
@@ -13020,6 +13107,8 @@ void CpModelPresolver::PresolveToFixPoint() {
                                   ConstraintProto::ConstraintCase>(
                                   source_types[i])), ",current_type=",
                               ConstraintCaseName(source.constraint_case()),
+                              ",source_two_var_diff=",
+                              source_two_var_diff[i],
                               ",current_proto=\"", absl::CEscape(current),
                               truncated ? "...truncated" : "",
                               "\",current_refs=");
