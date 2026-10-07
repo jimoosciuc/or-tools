@@ -12636,8 +12636,14 @@ void CpModelPresolver::PresolveToFixPoint() {
   PresolveTimer timer(__FUNCTION__, logger_, time_limit_);
   const bool runtime_diagnostics =
       context_->params().cp_sat_runtime_diagnostics();
+  const int64_t pfp_id =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
   RuntimeProgressStage stage(runtime_diagnostics, "presolve",
-                             "PresolveToFixPoint", "constraint_queue");
+                             "PresolveToFixPoint",
+                             runtime_diagnostics
+                                 ? absl::StrCat("presolve_to_fixpoint_pfp_",
+                                                pfp_id)
+                                 : "presolve_to_fixpoint");
   context_->BeginRuntimeDomainChangeCollection();
   absl::Cleanup domain_change_scope = [this] {
     context_->EndRuntimeDomainChangeCollection();
@@ -12646,9 +12652,91 @@ void CpModelPresolver::PresolveToFixPoint() {
       static_cast<int64_t>(context_->params()
                                .cp_sat_runtime_diagnostics_period_seconds()) *
       1'000'000'000;
-  int64_t last_runtime_log_ns = runtime_diagnostics
-                                    ? RuntimeProgressNowNanos()
-                                    : 0;
+  int64_t last_runtime_log_ns = pfp_id;
+  int64_t last_phase_summary_ns = pfp_id;
+  enum PfpPhase {
+    kQueueInitializeSort,
+    kQueueDrainBatch,
+    kSmallDegreeVariables,
+    kChangedVariables,
+    kEncodingVariables,
+    kDualModelScan,
+    kDualStrengthen,
+    kDominanceScanExploit,
+    kTailConstraintPass,
+    kPfpPhaseCount,
+  };
+  struct PfpPhaseStats {
+    int64_t calls = 0;
+    int64_t wall_ns = 0;
+  };
+  struct PfpPhaseTimer {
+    explicit PfpPhaseTimer(PfpPhaseStats* stats)
+        : stats(stats), start_ns(stats == nullptr ? 0
+                                                 : RuntimeProgressNowNanos()) {}
+    PfpPhaseTimer(const PfpPhaseTimer&) = delete;
+    PfpPhaseTimer& operator=(const PfpPhaseTimer&) = delete;
+    ~PfpPhaseTimer() { Finish(); }
+    void Snapshot(int64_t now) {
+      if (stats == nullptr) return;
+      stats->wall_ns += now - start_ns;
+      start_ns = now;
+    }
+    void Finish() {
+      if (stats == nullptr) return;
+      Snapshot(RuntimeProgressNowNanos());
+      ++stats->calls;
+      stats = nullptr;
+    }
+    PfpPhaseStats* stats;
+    int64_t start_ns;
+  };
+  constexpr std::array<const char*, kPfpPhaseCount> kPfpPhaseNames = {
+      "queue_initialize_sort", "queue_drain_batches",
+      "small_degree_variable_pass", "process_changed_variables",
+      "encoding_variable_pass", "dual_model_scan", "dual_strengthen",
+      "dominance_scan_and_exploit", "tail_constraint_pass"};
+  std::array<PfpPhaseStats, kPfpPhaseCount> pfp_phase_stats{};
+  std::array<PfpPhaseStats, kPfpPhaseCount> previous_pfp_phase_stats{};
+  auto phase_timer = [&](PfpPhase phase) {
+    return PfpPhaseTimer(runtime_diagnostics ? &pfp_phase_stats[phase]
+                                             : nullptr);
+  };
+  auto emit_phase_summary = [&](int64_t now, const char* boundary,
+                                bool queue_batch_active) {
+    if (!runtime_diagnostics) return;
+    int64_t accounted_wall_ns = 0;
+    std::string phase_summary;
+    for (int i = 0; i < kPfpPhaseCount; ++i) {
+      const PfpPhaseStats& current = pfp_phase_stats[i];
+      const PfpPhaseStats& previous = previous_pfp_phase_stats[i];
+      accounted_wall_ns += current.wall_ns;
+      absl::StrAppend(&phase_summary, "[", kPfpPhaseNames[i],
+                      "|calls_delta=", current.calls - previous.calls,
+                      "|wall_ns_delta=", current.wall_ns - previous.wall_ns,
+                      "|calls_total=", current.calls,
+                      "|wall_ns_total=", current.wall_ns, "]");
+    }
+    RuntimeProgressPrint(absl::StrCat(
+        "CP-SAT-RUNTIME event=PFP_PHASE_SUMMARY pfp_id=", pfp_id,
+        " boundary=", boundary, " elapsed_ns=", now - pfp_id,
+        " period_ns=", now - last_phase_summary_ns,
+        " phases_scope=completed_nonoverlapping_calls_plus_queue_snapshot",
+        " queue_batch_active=", queue_batch_active,
+        " queue_batch_scope=completed_batches_plus_active_elapsed_snapshot",
+        " queue_batch_includes_progress_format_and_print=true",
+        " accounted_phase_wall_ns=", accounted_wall_ns,
+        " unattributed_wall_ns=", now - pfp_id - accounted_wall_ns,
+        " phases=", phase_summary, "\n"));
+    previous_pfp_phase_stats = pfp_phase_stats;
+    last_phase_summary_ns = now;
+  };
+  absl::Cleanup final_phase_summary = [&] {
+    if (runtime_diagnostics) {
+      emit_phase_summary(RuntimeProgressNowNanos(), "end",
+                         /*queue_batch_active=*/false);
+    }
+  };
   int64_t processed_constraints = 0;
   struct ConstraintTypeRuntimeStats {
     int64_t calls = 0;
@@ -12683,6 +12771,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   absl::flat_hash_set<std::pair<int, int>> var_constraint_pair_already_called;
 
   // The queue of "active" constraints, initialized to the non-empty ones.
+  PfpPhaseTimer queue_initialize_sort = phase_timer(kQueueInitializeSort);
   std::vector<bool> in_queue(context_->working_model->constraints_size(),
                              false);
   std::deque<int> queue;
@@ -12707,6 +12796,7 @@ void CpModelPresolver::PresolveToFixPoint() {
       return score_a < score_b || (score_a == score_b && a < b);
     });
   }
+  queue_initialize_sort.Finish();
 
   // We put a hard limit on the number of loop to prevent some corner case with
   // propagation loops. Note that the limit is quite high so it shouldn't really
@@ -12717,8 +12807,15 @@ void CpModelPresolver::PresolveToFixPoint() {
     if (time_limit_->LimitReached()) break;
     if (context_->ModelIsUnsat()) break;
     if (context_->num_presolve_operations > max_num_operations) break;
+    if (runtime_diagnostics) {
+      const int64_t now = RuntimeProgressNowNanos();
+      if (now - last_phase_summary_ns >= runtime_period_ns) {
+        emit_phase_summary(now, "outer_loop", /*queue_batch_active=*/false);
+      }
+    }
 
     // Empty the queue of single constraint presolve.
+    PfpPhaseTimer queue_drain_batch = phase_timer(kQueueDrainBatch);
     while (!queue.empty() && !context_->ModelIsUnsat()) {
       if (time_limit_->LimitReached()) break;
       if (context_->num_presolve_operations > max_num_operations) break;
@@ -12942,6 +13039,7 @@ void CpModelPresolver::PresolveToFixPoint() {
           }
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=PROGRESS owner=presolve phase=fixpoint",
+              " pfp_id=", pfp_id,
               " processed_constraints=", processed_constraints,
               " queued_constraints=", queue.size(), " loops=", num_loops,
               " operations=", context_->num_presolve_operations,
@@ -12956,6 +13054,9 @@ void CpModelPresolver::PresolveToFixPoint() {
               ConstraintCaseName(context_->working_model->constraints(c)
                                      .constraint_case()),
               " monotonic_ns=", now, "\n"));
+          queue_drain_batch.Snapshot(now);
+          emit_phase_summary(now, "queue_progress",
+                             /*queue_batch_active=*/true);
           last_runtime_log_ns = now;
           if (rule_stats_available) {
             previous_rule_stats = context_->rule_stats();
@@ -12965,10 +13066,12 @@ void CpModelPresolver::PresolveToFixPoint() {
         }
       }
     }
+    queue_drain_batch.Finish();
 
     if (context_->ModelIsUnsat()) return;
 
     in_queue.resize(context_->working_model->constraints_size(), false);
+    PfpPhaseTimer small_degree_pass = phase_timer(kSmallDegreeVariables);
     const auto& vector_that_can_grow_during_iter =
         context_->var_with_reduced_small_degree.PositionsSetAtLeastOnce();
     for (int i = 0; i < vector_that_can_grow_during_iter.size(); ++i) {
@@ -13017,16 +13120,25 @@ void CpModelPresolver::PresolveToFixPoint() {
       }
     }
     context_->var_with_reduced_small_degree.SparseClearAll();
+    small_degree_pass.Finish();
 
-    if (ProcessChangedVariables(&in_queue, &queue)) continue;
+    auto process_changed_variables = [&] {
+      PfpPhaseTimer phase = phase_timer(kChangedVariables);
+      const bool changed = ProcessChangedVariables(&in_queue, &queue);
+      phase.Finish();
+      return changed;
+    };
+    if (process_changed_variables()) continue;
 
     DCHECK(!context_->HasUnusedAffineVariable());
 
     // Deal with integer variable only appearing in an encoding.
+    PfpPhaseTimer encoding_variable_pass = phase_timer(kEncodingVariables);
     for (int v = 0; v < context_->working_model->variables().size(); ++v) {
       ProcessVariableOnlyUsedInEncoding(v);
     }
-    if (ProcessChangedVariables(&in_queue, &queue)) continue;
+    encoding_variable_pass.Finish();
+    if (process_changed_variables()) continue;
 
     // Perform dual reasoning.
     //
@@ -13042,13 +13154,17 @@ void CpModelPresolver::PresolveToFixPoint() {
       if (context_->ModelIsUnsat()) return;
       ++num_dual_strengthening;
       DualBoundStrengthening dual_bound_strengthening;
+      PfpPhaseTimer dual_model_scan = phase_timer(kDualModelScan);
       ScanModelForDualBoundStrengthening(*context_, &dual_bound_strengthening);
+      dual_model_scan.Finish();
 
       // TODO(user): Make sure that if we fix one variable, we fix its full
       // symmetric orbit. There should be no reason that we don't do that
       // though.
+      PfpPhaseTimer dual_strengthen = phase_timer(kDualStrengthen);
       if (!dual_bound_strengthening.Strengthen(context_)) return;
-      if (ProcessChangedVariables(&in_queue, &queue)) break;
+      dual_strengthen.Finish();
+      if (process_changed_variables()) break;
 
       // It is possible we deleted some constraint, but the queue is empty.
       // In this case we redo a pass of dual bound strenghtening as we might
@@ -13070,9 +13186,12 @@ void CpModelPresolver::PresolveToFixPoint() {
       if (context_->ModelIsUnsat()) return;
       PresolveTimer timer("DetectDominanceRelations", logger_, time_limit_);
       VarDomination var_dom;
+      PfpPhaseTimer dominance_scan_exploit =
+          phase_timer(kDominanceScanExploit);
       ScanModelForDominanceDetection(*context_, &var_dom);
       if (!ExploitDominanceRelations(var_dom, context_)) return;
-      if (ProcessChangedVariables(&in_queue, &queue)) continue;
+      dominance_scan_exploit.Finish();
+      if (process_changed_variables()) continue;
     }
   }
 
@@ -13086,6 +13205,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   // TODO(user): ideally we should "wake-up" any constraint that contains an
   // absent interval in the main propagation loop above. But we currently don't
   // maintain such list.
+  PfpPhaseTimer tail_constraint_pass = phase_timer(kTailConstraintPass);
   const int num_constraints = context_->working_model->constraints_size();
   for (int c = 0; c < num_constraints; ++c) {
     ConstraintProto* ct = context_->working_model->mutable_constraints(c);
@@ -13128,6 +13248,7 @@ void CpModelPresolver::PresolveToFixPoint() {
         break;
     }
   }
+  tail_constraint_pass.Finish();
 
   timer.AddCounter("num_loops", num_loops);
   timer.AddCounter("num_dual_strengthening", num_dual_strengthening);
