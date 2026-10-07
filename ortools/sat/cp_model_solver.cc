@@ -1614,7 +1614,18 @@ class LnsSolver : public SubSolver {
         {
           RuntimeProgressStage stage(runtime_diagnostics, lns_info, "lns",
                                      "hint");
-          QuickSolveWithHint(lns_fragment, &local_model);
+          // As in the full solve, a complete feasible hint can be accepted
+          // without recovering the same assignment through search.
+          const bool complete_hint =
+              !local_params.enumerate_all_solutions() &&
+              SolutionHintIsCompleteAndFeasible(
+                  lns_fragment, /*logger=*/nullptr, local_response_manager);
+          if (runtime_diagnostics) {
+            RuntimeProgressPrint(absl::StrCat(
+                "CP-SAT-RUNTIME event=LNS_HINT owner=", lns_info,
+                " complete_feasible=", complete_hint, "\n"));
+          }
+          if (!complete_hint) QuickSolveWithHint(lns_fragment, &local_model);
         }
         log_search_stats("hint");
         {
@@ -1624,6 +1635,10 @@ class LnsSolver : public SubSolver {
         }
         log_search_stats("search");
         local_response = local_response_manager->GetResponse();
+        if (local_response.solution_info() == "complete_hint") {
+          local_response.set_solution_info(
+              absl::StrCat(lns_info, " [complete_hint]"));
+        }
 
         // In case the LNS model is empty after presolve, the solution
         // repository does not add the solution, and thus does not store the
