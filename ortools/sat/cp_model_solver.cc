@@ -1429,6 +1429,7 @@ class LnsSolver : public SubSolver {
 
       Model local_model(lns_info);
       *(local_model.GetOrCreate<SatParameters>()) = local_params;
+      const bool runtime_diagnostics = local_params.cp_sat_runtime_diagnostics();
       TimeLimit* local_time_limit = local_model.GetOrCreate<TimeLimit>();
       local_time_limit->ResetLimitFromParameters(local_params);
       shared_->time_limit->UpdateLocalLimit(local_time_limit);
@@ -1537,12 +1538,33 @@ class LnsSolver : public SubSolver {
       }
 
       std::vector<int> postsolve_mapping;
-      const CpSolverStatus presolve_status =
-          PresolveCpModel(context.get(), &postsolve_mapping);
+      CpSolverStatus presolve_status;
+      {
+        RuntimeProgressStage stage(runtime_diagnostics, lns_info, "lns",
+                                   "presolve");
+        presolve_status = PresolveCpModel(context.get(), &postsolve_mapping);
+      }
+      if (runtime_diagnostics) {
+        RuntimeProgressPrint(absl::StrCat(
+            "CP-SAT-RUNTIME event=LNS_PRESOLVE_RESULT owner=", lns_info,
+            " status=", CpSolverStatus_Name(presolve_status),
+            " deterministic_time=",
+            local_time_limit->GetElapsedDeterministicTime(),
+            " deterministic_limit=", data.deterministic_limit,
+            " variables=", lns_fragment.variables_size(),
+            " constraints=", lns_fragment.constraints_size(), "\n"));
+      }
 
       // It is important to stop here to avoid using a model for which the
       // presolve was interrupted in the middle.
-      if (local_time_limit->LimitReached()) return;
+      if (local_time_limit->LimitReached()) {
+        if (runtime_diagnostics) {
+          RuntimeProgressPrint(absl::StrCat(
+              "CP-SAT-RUNTIME event=LNS_EXIT owner=", lns_info,
+              " reason=limit_after_presolve solve_data_recorded=0\n"));
+        }
+        return;
+      }
 
       // Release the context.
       context.reset(nullptr);
@@ -1571,9 +1593,36 @@ class LnsSolver : public SubSolver {
         // load the model as it might fail some DCHECK.
         if (shared_->SearchIsDone()) return;
 
-        LoadCpModel(lns_fragment, &local_model);
-        QuickSolveWithHint(lns_fragment, &local_model);
-        SolveLoadedCpModel(lns_fragment, &local_model);
+        const auto log_search_stats = [&](const char* operation) {
+          if (!runtime_diagnostics) return;
+          const SatSolver* solver = local_model.Get<SatSolver>();
+          RuntimeProgressPrint(absl::StrCat(
+              "CP-SAT-RUNTIME event=LNS_SEARCH_STATS owner=", lns_info,
+              " operation=", operation,
+              " branches=", solver->num_branches(),
+              " conflicts=", solver->num_failures(),
+              " propagations=", solver->num_propagations(),
+              " deterministic_time=",
+              local_time_limit->GetElapsedDeterministicTime(), "\n"));
+        };
+        {
+          RuntimeProgressStage stage(runtime_diagnostics, lns_info, "lns",
+                                     "load_model");
+          LoadCpModel(lns_fragment, &local_model);
+        }
+        log_search_stats("load_model");
+        {
+          RuntimeProgressStage stage(runtime_diagnostics, lns_info, "lns",
+                                     "hint");
+          QuickSolveWithHint(lns_fragment, &local_model);
+        }
+        log_search_stats("hint");
+        {
+          RuntimeProgressStage stage(runtime_diagnostics, lns_info, "lns",
+                                     "search");
+          SolveLoadedCpModel(lns_fragment, &local_model);
+        }
+        log_search_stats("search");
         local_response = local_response_manager->GetResponse();
 
         // In case the LNS model is empty after presolve, the solution
@@ -1696,6 +1745,14 @@ class LnsSolver : public SubSolver {
       }
 
       generator_->AddSolveData(data);
+      if (runtime_diagnostics) {
+        RuntimeProgressPrint(absl::StrCat(
+            "CP-SAT-RUNTIME event=LNS_EXIT owner=", lns_info,
+            " reason=completed solve_data_recorded=1 status=",
+            CpSolverStatus_Name(data.status),
+            " deterministic_time=", data.deterministic_time,
+            " new_solution=", new_solution, "\n"));
+      }
 
       if (VLOG_IS_ON(2) && display_lns_info) {
         std::string s = absl::StrCat("              LNS ", name(), ":");
