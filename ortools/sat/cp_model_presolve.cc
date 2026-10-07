@@ -12630,6 +12630,239 @@ bool CpModelPresolver::ProcessChangedVariables(std::vector<bool>* in_queue,
   return !queue->empty();
 }
 
+namespace {
+
+struct DiffBoundsStats {
+  int64_t candidates = 0;
+  int64_t arcs = 0;
+  int64_t arc_work = 0;
+  int64_t arc_checks = 0;
+  int64_t bound_updates = 0;
+  int64_t build_wall_ns = 0;
+  int64_t propagation_wall_ns = 0;
+  bool work_limit_reached = false;
+  bool interrupted = false;
+};
+
+bool FitsInt64(absl::int128 value) {
+  return value >= std::numeric_limits<int64_t>::min() &&
+         value <= std::numeric_limits<int64_t>::max();
+}
+
+absl::int128 FloorDivPositive(absl::int128 value, absl::int128 divisor) {
+  absl::int128 quotient = value / divisor;
+  if (value % divisor < 0) --quotient;
+  return quotient;
+}
+
+absl::int128 CeilDivPositive(absl::int128 value, absl::int128 divisor) {
+  absl::int128 quotient = value / divisor;
+  if (value % divisor > 0) ++quotient;
+  return quotient;
+}
+
+struct DiffBoundsArc {
+  int tail_ref;
+  int head_ref;
+  absl::int128 offset;
+};
+
+// Adds bounds entailed by unconditioned two-variable linear constraints.
+// The original constraints remain in the normal presolve queue.
+bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
+                                         bool runtime_diagnostics,
+                                         DiffBoundsStats* stats) {
+  const int64_t build_start_ns =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
+  std::vector<DiffBoundsArc> arcs;
+  CpModelProto* model = context->working_model;
+  bool feasible = true;
+  for (int c = 0; c < model->constraints_size(); ++c) {
+    if ((c & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      break;
+    }
+    const ConstraintProto& ct = model->constraints(c);
+    if (ct.constraint_case() != ConstraintProto::kLinear ||
+        ct.enforcement_literal_size() != 0) {
+      continue;
+    }
+    const LinearConstraintProto& linear = ct.linear();
+    if (linear.vars_size() != 2 || linear.coeffs_size() != 2 ||
+        linear.domain_size() != 2 || linear.domain(0) > linear.domain(1) ||
+        PositiveRef(linear.vars(0)) == PositiveRef(linear.vars(1))) {
+      continue;
+    }
+    if (linear.coeffs(0) == 0 || linear.coeffs(1) == 0) continue;
+
+    const AffineRelation::Relation relation0 =
+        context->GetAffineRelation(linear.vars(0));
+    const AffineRelation::Relation relation1 =
+        context->GetAffineRelation(linear.vars(1));
+    const int rep0 = relation0.representative;
+    const int rep1 = relation1.representative;
+    if (context->VariableWasRemoved(rep0) ||
+        context->VariableWasRemoved(rep1) || rep0 == rep1) {
+      continue;
+    }
+
+    const absl::int128 coeff0 =
+        absl::int128(linear.coeffs(0)) * relation0.coeff;
+    const absl::int128 coeff1 =
+        absl::int128(linear.coeffs(1)) * relation1.coeff;
+    if (coeff0 == 0 || coeff1 == 0 ||
+        (coeff0 < 0 ? -coeff0 : coeff0) !=
+            (coeff1 < 0 ? -coeff1 : coeff1)) {
+      continue;
+    }
+    const absl::int128 shift0 =
+        absl::int128(linear.coeffs(0)) * relation0.offset;
+    const absl::int128 shift1 =
+        absl::int128(linear.coeffs(1)) * relation1.offset;
+    if (!FitsInt64(shift0) || !FitsInt64(shift1)) continue;
+    const absl::int128 lower = absl::int128(linear.domain(0)) - shift0 - shift1;
+    const absl::int128 upper = absl::int128(linear.domain(1)) - shift0 - shift1;
+    if (!FitsInt64(lower) || !FitsInt64(upper)) continue;
+
+    ++stats->candidates;
+    const absl::int128 magnitude = coeff0 < 0 ? -coeff0 : coeff0;
+    const absl::int128 normalized_lower =
+        CeilDivPositive(lower, magnitude);
+    const absl::int128 normalized_upper =
+        FloorDivPositive(upper, magnitude);
+    if (!FitsInt64(normalized_lower) || !FitsInt64(normalized_upper)) {
+      continue;
+    }
+    if (normalized_lower > normalized_upper) {
+      feasible = context->IntersectDomainWith(rep0, Domain());
+      break;
+    }
+
+    const int signed0 = coeff0 > 0 ? rep0 : NegatedRef(rep0);
+    const int signed1 = coeff1 > 0 ? rep1 : NegatedRef(rep1);
+    const int u = signed0;
+    const int v = NegatedRef(signed1);
+    arcs.push_back({u, v, -normalized_upper});
+    arcs.push_back({v, u, normalized_lower});
+  }
+  stats->arcs = arcs.size();
+  if (!feasible || stats->interrupted || arcs.empty()) {
+    if (runtime_diagnostics) {
+      stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+    }
+    return feasible;
+  }
+  const int64_t work_limit = 4 * stats->arcs;
+  const int num_variables = model->variables_size();
+  std::vector<std::vector<int>> incident_arcs(num_variables);
+  for (int i = 0; i < arcs.size(); ++i) {
+    if ((i & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      break;
+    }
+    incident_arcs[PositiveRef(arcs[i].tail_ref)].push_back(i);
+    incident_arcs[PositiveRef(arcs[i].head_ref)].push_back(i);
+  }
+  if (stats->interrupted) {
+    if (runtime_diagnostics) {
+      stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+    }
+    return true;
+  }
+  std::deque<int> queue;
+  std::vector<bool> in_queue(arcs.size(), false);
+  auto consume_work = [&] {
+    if (stats->arc_work >= work_limit) {
+      stats->work_limit_reached = true;
+      return false;
+    }
+    ++stats->arc_work;
+    if ((stats->arc_work & 1023) == 0 &&
+        context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return false;
+    }
+    return true;
+  };
+  auto enqueue_incident = [&](int ref) {
+    for (const int arc : incident_arcs[PositiveRef(ref)]) {
+      if (!consume_work()) return false;
+      if (in_queue[arc]) continue;
+      if (!consume_work()) return false;
+      in_queue[arc] = true;
+      queue.push_back(arc);
+    }
+    return true;
+  };
+  for (int i = 0; i < arcs.size(); ++i) {
+    if (!consume_work()) break;
+    in_queue[i] = true;
+    queue.push_back(i);
+  }
+  if (runtime_diagnostics) {
+    stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+  }
+
+  const int64_t propagation_start_ns =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
+  while (feasible && !queue.empty() && !stats->work_limit_reached &&
+         !stats->interrupted) {
+    if (!consume_work()) break;
+    const int arc_index = queue.front();
+    queue.pop_front();
+    in_queue[arc_index] = false;
+    ++stats->arc_checks;
+    const DiffBoundsArc& arc = arcs[arc_index];
+    const absl::int128 tail_min = context->MinOf(arc.tail_ref);
+    const absl::int128 tail_max = context->MaxOf(arc.tail_ref);
+    const absl::int128 head_min = context->MinOf(arc.head_ref);
+    const absl::int128 head_max = context->MaxOf(arc.head_ref);
+    if (tail_min + arc.offset > head_max) {
+      feasible = context->IntersectDomainWith(arc.head_ref, Domain());
+      break;
+    }
+
+    const absl::int128 new_head_min =
+        std::max(head_min, tail_min + arc.offset);
+    if (new_head_min > head_min) {
+      bool changed = false;
+      feasible = context->IntersectDomainWith(
+          arc.head_ref,
+          Domain(static_cast<int64_t>(new_head_min),
+                 static_cast<int64_t>(head_max)),
+          &changed);
+      if (!feasible) break;
+      if (changed) {
+        ++stats->bound_updates;
+        if (!enqueue_incident(arc.head_ref)) break;
+      }
+    }
+
+    const absl::int128 new_tail_max =
+        std::min(tail_max, head_max - arc.offset);
+    if (new_tail_max < tail_max) {
+      bool changed = false;
+      feasible = context->IntersectDomainWith(
+          arc.tail_ref,
+          Domain(static_cast<int64_t>(tail_min),
+                 static_cast<int64_t>(new_tail_max)),
+          &changed);
+      if (!feasible) break;
+      if (changed) {
+        ++stats->bound_updates;
+        if (!enqueue_incident(arc.tail_ref)) break;
+      }
+    }
+  }
+  if (runtime_diagnostics) {
+    stats->propagation_wall_ns =
+        RuntimeProgressNowNanos() - propagation_start_ns;
+  }
+  return feasible;
+}
+
+}  // namespace
+
 void CpModelPresolver::PresolveToFixPoint() {
   if (time_limit_->LimitReached()) return;
   if (context_->ModelIsUnsat()) return;
@@ -12695,6 +12928,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   };
   enum PfpPhase {
     kQueueInitializeSort,
+    kDifferenceBoundsEntryBatch,
     kQueueDrainBatch,
     kSmallDegreeVariables,
     kChangedVariables,
@@ -12731,7 +12965,8 @@ void CpModelPresolver::PresolveToFixPoint() {
     int64_t start_ns;
   };
   constexpr std::array<const char*, kPfpPhaseCount> kPfpPhaseNames = {
-      "queue_initialize_sort", "queue_drain_batches",
+      "queue_initialize_sort", "difference_bounds_entry_batch",
+      "queue_drain_batches",
       "small_degree_variable_pass", "process_changed_variables",
       "encoding_variable_pass", "dual_model_scan", "dual_strengthen",
       "dominance_scan_and_exploit", "tail_constraint_pass"};
@@ -12873,6 +13108,29 @@ void CpModelPresolver::PresolveToFixPoint() {
     });
   }
   queue_initialize_sort.Finish();
+
+  PfpPhaseTimer difference_bounds_entry_batch =
+      phase_timer(kDifferenceBoundsEntryBatch);
+  DiffBoundsStats diff_bounds_stats;
+  const bool diff_bounds_feasible = PropagateTwoVariableDifferenceBounds(
+      context_, runtime_diagnostics, &diff_bounds_stats);
+  difference_bounds_entry_batch.Finish();
+  if (runtime_diagnostics) {
+    RuntimeProgressPrint(absl::StrCat(
+        "CP-SAT-RUNTIME event=PFP_DIFF_BOUNDS pfp_id=", pfp_id,
+        " candidates=", diff_bounds_stats.candidates,
+        " arcs=", diff_bounds_stats.arcs,
+        " arc_work=", diff_bounds_stats.arc_work,
+        " arc_checks=", diff_bounds_stats.arc_checks,
+        " bound_updates=", diff_bounds_stats.bound_updates,
+        " work_limit_reached=", diff_bounds_stats.work_limit_reached,
+        " interrupted=", diff_bounds_stats.interrupted,
+        " feasible=", diff_bounds_feasible,
+        " build_wall_ns=", diff_bounds_stats.build_wall_ns,
+        " propagation_wall_ns=", diff_bounds_stats.propagation_wall_ns,
+        " scope=single_entry_batch_original_constraints_retained\n"));
+  }
+  if (!diff_bounds_feasible) return;
 
   // We put a hard limit on the number of loop to prevent some corner case with
   // propagation loops. Note that the limit is quite high so it shouldn't really
