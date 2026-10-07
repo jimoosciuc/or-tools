@@ -1457,13 +1457,11 @@ bool DisjunctiveNotLast::Propagate() {
 bool DisjunctiveNotLast::PropagateSubwindow(
     GenericLiteralWatcher::RuntimeNotLastStats* runtime_stats) {
   auto& task_by_increasing_end_max = start_max_window_;
+  IntegerValue threshold = kMinIntegerValue;
   for (TaskTime& entry : task_by_increasing_end_max) {
     entry.time = helper_->EndMax(entry.task_index);
+    threshold = std::max(threshold, entry.time);
   }
-  IncrementalSort(task_by_increasing_end_max.begin(),
-                  task_by_increasing_end_max.end());
-
-  const IntegerValue threshold = task_by_increasing_end_max.back().time;
   auto& task_by_increasing_start_max = start_min_window_;
   int queue_size = 0;
   for (const TaskTime entry : task_by_increasing_start_max) {
@@ -1484,6 +1482,8 @@ bool DisjunctiveNotLast::PropagateSubwindow(
     return true;
   }
 
+  IncrementalSort(task_by_increasing_end_max.begin(),
+                  task_by_increasing_end_max.end());
   task_by_increasing_start_max.resize(queue_size);
   std::sort(task_by_increasing_start_max.begin(),
             task_by_increasing_start_max.end());
