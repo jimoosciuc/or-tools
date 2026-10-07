@@ -337,6 +337,12 @@ class IntegerSearchHelper {
   int64_t runtime_integer_upper_decisions_ = 0;
   int64_t runtime_unmapped_decisions_ = 0;
   int64_t runtime_decision_last_summary_ns_ = 0;
+  int runtime_last_selected_proto_variable_ = -1;
+  const char* runtime_last_selected_kind_ = "unknown";
+  int runtime_last_conflict_proto_variable_ = -1;
+  const char* runtime_last_conflict_kind_ = "unknown";
+  int runtime_last_conflict_level_before_ = -1;
+  int runtime_last_conflict_level_after_ = -1;
 
   bool must_process_conflict_ = false;
 };

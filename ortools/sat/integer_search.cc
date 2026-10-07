@@ -1375,17 +1375,21 @@ void IntegerSearchHelper::RecordSelectedDecision(
     ++runtime_boolean_decisions_;
     proto_variable = cp_model_mapping_->GetProtoVariableFromBooleanVariable(
         Literal(decision.boolean_literal_index).Variable());
+    runtime_last_selected_kind_ = "boolean";
   } else {
     const IntegerLiteral integer_decision = decision.integer_literal;
     if (VariableIsPositive(integer_decision.var)) {
       ++runtime_integer_lower_decisions_;
+      runtime_last_selected_kind_ = "integer_lower";
     } else {
       ++runtime_integer_upper_decisions_;
+      runtime_last_selected_kind_ = "integer_upper";
     }
     proto_variable = cp_model_mapping_->GetProtoVariableFromIntegerVariable(
         PositiveVariable(integer_decision.var));
   }
 
+  runtime_last_selected_proto_variable_ = proto_variable;
   ++runtime_selected_decisions_;
   if (proto_variable >= 0 &&
       static_cast<size_t>(proto_variable) <
@@ -1428,6 +1432,17 @@ void IntegerSearchHelper::MaybePrintSelectedDecisionSummary() {
     absl::StrAppend(&top_variables, proto_variable, ":",
                     proto->variables(proto_variable).name(), ":", count);
   }
+  const char* last_conflict_name = "<unmapped>";
+  if (runtime_last_conflict_proto_variable_ >= 0 &&
+      runtime_last_conflict_proto_variable_ < proto->variables_size()) {
+    last_conflict_name =
+        proto->variables(runtime_last_conflict_proto_variable_).name().c_str();
+  }
+  const std::string last_conflict_decision =
+      runtime_last_conflict_level_before_ < 0
+          ? "unknown"
+          : absl::StrCat(runtime_last_conflict_proto_variable_, ":",
+                         last_conflict_name, ":", runtime_last_conflict_kind_);
   RuntimeProgressPrint(absl::StrCat(
       "CP-SAT-RUNTIME event=DECISION_SUMMARY owner=", model_->Name(),
       " selected_decisions=", runtime_selected_decisions_,
@@ -1435,7 +1450,11 @@ void IntegerSearchHelper::MaybePrintSelectedDecisionSummary() {
       " integer_lower_decisions=", runtime_integer_lower_decisions_,
       " integer_upper_decisions=", runtime_integer_upper_decisions_,
       " unmapped_decisions=", runtime_unmapped_decisions_,
-      " top_proto_variables=", top_variables, "\n"));
+      " top_proto_variables=", top_variables,
+      " last_conflict_decision=", last_conflict_decision,
+      " last_conflict_level_before=", runtime_last_conflict_level_before_,
+      " last_conflict_level_after=", runtime_last_conflict_level_after_,
+      "\n"));
 }
 
 bool IntegerSearchHelper::BeforeTakingDecision() {
@@ -1551,8 +1570,20 @@ bool IntegerSearchHelper::TakeDecision(Literal decision) {
   //
   // TODO(user): on some problems, this function can be quite long. Expand
   // so that we can check the time limit at each step?
+  const int64_t failures_before = runtime_decision_diagnostics_
+                                      ? sat_solver_->num_failures()
+                                      : 0;
   const int old_level = sat_solver_->CurrentDecisionLevel();
   const int index = sat_solver_->EnqueueDecisionAndBackjumpOnConflict(decision);
+  if (runtime_decision_diagnostics_ &&
+      sat_solver_->num_failures() > failures_before) {
+    // This associates the selected branch with an immediate search conflict;
+    // it does not identify a model constraint or semantic cause.
+    runtime_last_conflict_proto_variable_ = runtime_last_selected_proto_variable_;
+    runtime_last_conflict_kind_ = runtime_last_selected_kind_;
+    runtime_last_conflict_level_before_ = old_level;
+    runtime_last_conflict_level_after_ = sat_solver_->CurrentDecisionLevel();
+  }
   if (index == kUnsatTrailIndex) return false;
 
   // Update the implied bounds each time we enqueue a literal at level zero.
