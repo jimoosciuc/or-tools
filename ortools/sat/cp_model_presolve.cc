@@ -13396,13 +13396,17 @@ void CpModelPresolver::PresolveToFixPoint() {
       ++difference_bounds_round_batches;
       difference_bounds_round_closure_updates +=
           round_stats.potential_closure_updates;
-      difference_bounds_round_last_skip_reason =
-          round_stats.potential_skip_reason;
       if (!round_feasible) return;
-      run_difference_bounds_rounds =
+      const bool round_succeeded =
           std::string_view(round_stats.algorithm) == "potential_dijkstra" &&
           std::string_view(round_stats.potential_skip_reason) == "none" &&
           !round_stats.interrupted;
+      difference_bounds_round_last_skip_reason =
+          round_succeeded && round_stats.potential_closure_updates == 0
+              ? "no_bound_updates"
+              : round_stats.potential_skip_reason;
+      run_difference_bounds_rounds =
+          round_succeeded && round_stats.potential_closure_updates > 0;
     }
     if (runtime_diagnostics) {
       const int64_t now = RuntimeProgressNowNanos();
