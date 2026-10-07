@@ -683,6 +683,96 @@ std::function<BooleanOrIntegerLiteral()> SchedulingSearchHeuristic(
 
 namespace {
 
+// Observe native heuristic proposals without changing which literal is returned.
+class DisjunctiveDecisionDiagnostics {
+ public:
+  explicit DisjunctiveDecisionDiagnostics(Model* model)
+      : model_(model),
+        mapping_(model->GetOrCreate<CpModelMapping>()),
+        proto_(mapping_->GetCpModelProto()),
+        start_counts_(proto_ == nullptr ? 0 : proto_->variables_size(), 0),
+        period_ns_(1000000000LL *
+                   model->GetOrCreate<SatParameters>()
+                       ->cp_sat_runtime_diagnostics_period_seconds()) {}
+
+  void Record(SchedulingConstraintHelper* helper, int before, int after,
+              bool presence, LiteralIndex literal) {
+    ++proposals_;
+    presence_proposals_ += presence;
+    no_literal_returns_ += literal == kNoLiteralIndex;
+    const int before_proto =
+        CountStart(helper->GetIntervalDefinition(before).start);
+    const int after_proto = CountStart(helper->GetIntervalDefinition(after).start);
+    if (literal != kNoLiteralIndex && literal == last_literal_) {
+      ++same_literal_run_;
+    } else {
+      same_literal_run_ = literal == kNoLiteralIndex ? 0 : 1;
+    }
+    last_literal_ = literal;
+    max_same_literal_run_ = std::max(max_same_literal_run_, same_literal_run_);
+    if (proposals_ != 1 && (proposals_ & 1023) != 0) return;
+    const int64_t now_ns = RuntimeProgressNowNanos();
+    if (proposals_ != 1 && now_ns - last_report_ns_ < period_ns_) return;
+    last_report_ns_ = now_ns;
+
+    std::vector<std::pair<int64_t, int>> top;
+    for (int i = 0; i < static_cast<int>(start_counts_.size()); ++i) {
+      if (start_counts_[i] > 0) top.emplace_back(start_counts_[i], i);
+    }
+    const int count = std::min(5, static_cast<int>(top.size()));
+    std::partial_sort(top.begin(), top.begin() + count, top.end(),
+                      std::greater<>());
+    std::string top_variables;
+    for (int i = 0; i < count; ++i) {
+      if (i != 0) top_variables += ';';
+      absl::StrAppend(&top_variables, top[i].second, ":",
+                      proto_->variables(top[i].second).name(), ":", top[i].first);
+    }
+    RuntimeProgressPrint(absl::StrCat(
+        "CP-SAT-RUNTIME event=DISJUNCTIVE_DECISION_SUMMARY owner=", model_->Name(),
+        " scope=heuristic_proposals proposals=", proposals_,
+        " presence_proposals=", presence_proposals_,
+        " precedence_proposals=", proposals_ - presence_proposals_,
+        " no_literal_returns=", no_literal_returns_,
+        " unmapped_start_endpoints=", unmapped_starts_,
+        " max_consecutive_same_literal=", max_same_literal_run_,
+        " literal_index=", literal.value(), " helper_tasks=", helper->NumTasks(),
+        " before_task=", before, " after_task=", after,
+        " before_start_proto=", before_proto, " after_start_proto=", after_proto,
+        " before_bounds=", helper->TaskDebugString(before),
+        " after_bounds=", helper->TaskDebugString(after),
+        " top_start_endpoints=", top_variables, "\n"));
+  }
+
+ private:
+  int CountStart(AffineExpression start) {
+    const int index = proto_ == nullptr || start.var == kNoIntegerVariable
+                          ? -1
+                          : mapping_->GetProtoVariableFromIntegerVariable(
+                                PositiveVariable(start.var));
+    if (index >= 0 && index < static_cast<int>(start_counts_.size())) {
+      ++start_counts_[index];
+      return index;
+    }
+    ++unmapped_starts_;
+    return -1;
+  }
+
+  Model* model_;
+  CpModelMapping* mapping_;
+  const CpModelProto* proto_;
+  std::vector<int64_t> start_counts_;
+  const int64_t period_ns_;
+  int64_t proposals_ = 0;
+  int64_t presence_proposals_ = 0;
+  int64_t no_literal_returns_ = 0;
+  int64_t unmapped_starts_ = 0;
+  int64_t last_report_ns_ = 0;
+  LiteralIndex last_literal_ = kNoLiteralIndex;
+  int64_t same_literal_run_ = 0;
+  int64_t max_same_literal_run_ = 0;
+};
+
 bool PrecedenceIsBetter(SchedulingConstraintHelper* helper, int a,
                         SchedulingConstraintHelper* other_helper, int other_a) {
   return std::make_tuple(helper->StartMin(a), helper->StartMax(a),
@@ -701,7 +791,11 @@ bool PrecedenceIsBetter(SchedulingConstraintHelper* helper, int a,
 std::function<BooleanOrIntegerLiteral()> DisjunctivePrecedenceSearchHeuristic(
     Model* model) {
   auto* repo = model->GetOrCreate<IntervalsRepository>();
-  return [repo]() {
+  auto* diagnostics =
+      model->GetOrCreate<SatParameters>()->cp_sat_runtime_diagnostics()
+          ? model->GetOrCreate<DisjunctiveDecisionDiagnostics>()
+          : nullptr;
+  return [repo, diagnostics]() {
     SchedulingConstraintHelper* best_helper = nullptr;
     int best_before;
     int best_after;
@@ -750,7 +844,12 @@ std::function<BooleanOrIntegerLiteral()> DisjunctivePrecedenceSearchHeuristic(
       for (const int t : {best_before, best_after}) {
         if (!best_helper->IsPresent(t)) {
           VLOG(2) << "Presence: " << best_helper->TaskDebugString(t);
-          return BooleanOrIntegerLiteral(best_helper->PresenceLiteral(t));
+          const LiteralIndex literal = best_helper->PresenceLiteral(t).Index();
+          if (diagnostics != nullptr) {
+            diagnostics->Record(best_helper, best_before, best_after, true,
+                                literal);
+          }
+          return BooleanOrIntegerLiteral(literal);
         }
       }
 
@@ -759,8 +858,12 @@ std::function<BooleanOrIntegerLiteral()> DisjunctivePrecedenceSearchHeuristic(
               << best_helper->TaskDebugString(best_after);
       const auto a = best_helper->GetIntervalDefinition(best_before);
       const auto b = best_helper->GetIntervalDefinition(best_after);
-      return BooleanOrIntegerLiteral(
-          repo->GetOrCreateDisjunctivePrecedenceLiteral(a, b));
+      const LiteralIndex literal =
+          repo->GetOrCreateDisjunctivePrecedenceLiteral(a, b);
+      if (diagnostics != nullptr) {
+        diagnostics->Record(best_helper, best_before, best_after, false, literal);
+      }
+      return BooleanOrIntegerLiteral(literal);
     }
 
     return BooleanOrIntegerLiteral();
