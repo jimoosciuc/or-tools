@@ -1394,6 +1394,8 @@ class LnsSolver : public SubSolver {
         }
       }
 
+      // A task without a solution made no objective improvement.
+      data.new_objective = data.base_objective;
       Neighborhood neighborhood =
           generator_->Generate(base_response, data, random);
 
@@ -1558,10 +1560,17 @@ class LnsSolver : public SubSolver {
       // It is important to stop here to avoid using a model for which the
       // presolve was interrupted in the middle.
       if (local_time_limit->LimitReached()) {
+        data.status = CpSolverStatus::UNKNOWN;
+        data.deterministic_time +=
+            local_time_limit->GetElapsedDeterministicTime();
+        generator_->AddSolveData(data);
         if (runtime_diagnostics) {
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=LNS_EXIT owner=", lns_info,
-              " reason=limit_after_presolve solve_data_recorded=0\n"));
+              " reason=limit_after_presolve solve_data_recorded=1 status=UNKNOWN",
+              " deterministic_time=", data.deterministic_time,
+              " base_objective=", data.base_objective.value(),
+              " new_objective=", data.new_objective.value(), "\n"));
         }
         return;
       }
@@ -1731,7 +1740,6 @@ class LnsSolver : public SubSolver {
         }
 
         // Finish to fill the SolveData now that the local solve is done.
-        data.new_objective = data.base_objective;
         if (data.status == CpSolverStatus::OPTIMAL ||
             data.status == CpSolverStatus::FEASIBLE) {
           data.new_objective = IntegerValue(ComputeInnerObjective(
@@ -1766,6 +1774,8 @@ class LnsSolver : public SubSolver {
             " reason=completed solve_data_recorded=1 status=",
             CpSolverStatus_Name(data.status),
             " deterministic_time=", data.deterministic_time,
+            " base_objective=", data.base_objective.value(),
+            " new_objective=", data.new_objective.value(),
             " new_solution=", new_solution, "\n"));
       }
 
