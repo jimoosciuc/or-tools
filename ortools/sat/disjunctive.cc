@@ -187,6 +187,33 @@ void TaskSet::AddShiftedStartMinEntry(const SchedulingConstraintHelper& helper,
   AddEntry({t, std::max(helper.StartMin(t), helper.EndMin(t) - dmin), dmin});
 }
 
+void TaskSet::AddShiftedStartMinEntries(
+    const SchedulingConstraintHelper& helper,
+    const FixedCapacityVector<int>& tasks) {
+  if (tasks.size() == 1) {
+    AddShiftedStartMinEntry(helper, tasks[0]);
+    return;
+  }
+  DCHECK_GT(tasks.size(), 1);
+
+  const int old_size = sorted_tasks_.size();
+  const int old_restart = optimized_restart_;
+  const IntegerValue restart_start_min =
+      old_size == 0 ? IntegerValue(0) : sorted_tasks_[old_restart].start_min;
+  for (const int t : tasks) {
+    const IntegerValue dmin = helper.SizeMin(t);
+    sorted_tasks_.push_back(
+        {t, std::max(helper.StartMin(t), helper.EndMin(t) - dmin), dmin});
+  }
+
+  auto middle = sorted_tasks_.begin() + old_size;
+  std::stable_sort(middle, sorted_tasks_.end());
+  const IntegerValue new_start_min = middle->start_min;
+  std::inplace_merge(sorted_tasks_.begin(), middle, sorted_tasks_.end());
+  optimized_restart_ =
+      old_size == 0 || new_start_min < restart_start_min ? 0 : old_restart;
+}
+
 void TaskSet::NotifyEntryIsNowLastIfPresent(const Entry& e) {
   const int size = sorted_tasks_.size();
   for (int i = 0;; ++i) {
@@ -1073,9 +1100,7 @@ bool DisjunctiveDetectablePrecedences::PropagateWithRanks() {
       DCHECK(!helper_->IsAbsent(blocking_task));
 
       if (!to_add_.empty()) {
-        for (const int t : to_add_) {
-          task_set_.AddShiftedStartMinEntry(*helper_, t);
-        }
+        task_set_.AddShiftedStartMinEntries(*helper_, to_add_);
         to_add_.clear();
         task_set_end_min = task_set_.ComputeEndMin();
       }
@@ -1111,9 +1136,7 @@ bool DisjunctiveDetectablePrecedences::PropagateWithRanks() {
       if (t == blocking_task) continue;  // Already done.
 
       if (!to_add_.empty()) {
-        for (const int t : to_add_) {
-          task_set_.AddShiftedStartMinEntry(*helper_, t);
-        }
+        task_set_.AddShiftedStartMinEntries(*helper_, to_add_);
         to_add_.clear();
         task_set_end_min = task_set_.ComputeEndMin();
       }

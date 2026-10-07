@@ -112,6 +112,81 @@ TEST(TaskSetTest, IgnoringTheLastEntry) {
   EXPECT_EQ(5, tasks.ComputeEndMin(/*task_to_ignore=*/1, &critical_index));
 }
 
+TEST(TaskSetTest, BatchShiftedEntriesMatchIndividualInsertion) {
+  Model model;
+  auto* intervals = model.GetOrCreate<IntervalsRepository>();
+  std::vector<IntervalVariable> interval_vars;
+  const std::vector<int> starts = {0, 10, 5, 10, 12, 10, -2, 12};
+  const std::vector<int> sizes = {10, 1, 20, 2, 1, 0, 0, 0};
+  for (int i = 0; i < starts.size(); ++i) {
+    interval_vars.push_back(intervals->CreateInterval(
+        AffineExpression(IntegerValue(starts[i])),
+        AffineExpression(IntegerValue(starts[i] + sizes[i])),
+        AffineExpression(IntegerValue(sizes[i])), kNoLiteralIndex, false));
+  }
+  SchedulingConstraintHelper* helper =
+      intervals->GetOrCreateHelper(interval_vars);
+  ASSERT_TRUE(helper->SynchronizeAndSetTimeDirection(true));
+
+  struct BatchCase {
+    std::vector<int> prefix;
+    std::vector<int> batch;
+  };
+  const std::vector<BatchCase> cases = {
+      {{}, {6, 2}},         // Empty prefix, negative start, and zero size.
+      {{}, {4}},            // Single-entry batch.
+      {{0, 1}, {2, 3, 4}},  // New minimum before the cached critical entry.
+      {{0, 1}, {3, 5}},     // Equal to the cached start-min; stable after prefix.
+      {{0, 1}, {4, 7}},     // Entire batch after the cached critical entry.
+  };
+  for (const BatchCase& batch_case : cases) {
+    TaskSet batched(interval_vars.size());
+    TaskSet individual(interval_vars.size());
+    for (const int t : batch_case.prefix) {
+      batched.AddShiftedStartMinEntry(*helper, t);
+      individual.AddShiftedStartMinEntry(*helper, t);
+    }
+    if (!batch_case.prefix.empty()) {
+      EXPECT_EQ(batched.ComputeEndMin(), individual.ComputeEndMin());
+      ASSERT_EQ(batched.GetCriticalIndex(), 1);
+      ASSERT_EQ(individual.GetCriticalIndex(), 1);
+    }
+
+    FixedCapacityVector<int> batch;
+    batch.ClearAndReserve(batch_case.batch.size());
+    for (const int t : batch_case.batch) {
+      batch.push_back(t);
+      individual.AddShiftedStartMinEntry(*helper, t);
+    }
+    batched.AddShiftedStartMinEntries(*helper, batch);
+
+    const auto batched_entries = batched.SortedTasks();
+    const auto individual_entries = individual.SortedTasks();
+    ASSERT_EQ(batched_entries.size(), individual_entries.size());
+    for (int i = 0; i < batched_entries.size(); ++i) {
+      EXPECT_EQ(batched_entries[i].task, individual_entries[i].task);
+      EXPECT_EQ(batched_entries[i].start_min, individual_entries[i].start_min);
+      EXPECT_EQ(batched_entries[i].size_min, individual_entries[i].size_min);
+    }
+
+    int batched_critical = -1;
+    int individual_critical = -1;
+    EXPECT_EQ(batched.ComputeEndMin(), individual.ComputeEndMin());
+    EXPECT_EQ(batched.GetCriticalIndex(), individual.GetCriticalIndex());
+    EXPECT_EQ(batched.ComputeEndMin(/*task_to_ignore=*/-1, &batched_critical),
+              individual.ComputeEndMin(/*task_to_ignore=*/-1,
+                                       &individual_critical));
+    EXPECT_EQ(batched_critical, individual_critical);
+    for (const auto& entry : batched_entries) {
+      batched_critical = -1;
+      individual_critical = -1;
+      EXPECT_EQ(batched.ComputeEndMin(entry.task, &batched_critical),
+                individual.ComputeEndMin(entry.task, &individual_critical));
+      EXPECT_EQ(batched_critical, individual_critical);
+    }
+  }
+}
+
 #define MIN_START(v) IntegerValue(v)
 #define MIN_DURATION(v) IntegerValue(v)
 

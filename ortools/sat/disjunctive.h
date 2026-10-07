@@ -79,6 +79,9 @@ class TaskSet {
   // Same as AddEntry({t, helper->ShiftedStartMin(t), helper->SizeMin(t)}).
   // This is a minor optimization to not call SizeMin(t) twice.
   void AddShiftedStartMinEntry(const SchedulingConstraintHelper& helper, int t);
+  // Adds a non-empty batch while preserving the order of equal start-mins.
+  void AddShiftedStartMinEntries(const SchedulingConstraintHelper& helper,
+                                 const FixedCapacityVector<int>& tasks);
 
   // Advanced usage, if the entry is present, this assumes that its start_min is
   // >= the end min without it, and update the datastructure accordingly.
