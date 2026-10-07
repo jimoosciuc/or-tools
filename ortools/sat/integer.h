@@ -1095,6 +1095,28 @@ class RevIntegerValueRepository : public RevRepository<IntegerValue> {
 // TODO(user): Move this to its own file. Add unit tests!
 class GenericLiteralWatcher final : public SatPropagator {
  public:
+  struct RuntimeNotLastStats {
+    int num_tasks = 0;
+    bool is_forward = true;
+    int64_t windows = 0;
+    // Scan checks count visits, not unique tasks; a task can be checked again.
+    int64_t start_min_scan_checks = 0;
+    int64_t start_max_scan_checks = 0;
+    int64_t one_task_windows = 0;
+    int64_t empty_start_max_windows = 0;
+    int64_t subwindows = 0;
+    int64_t critical_queue_le_one_subwindows = 0;
+    int64_t end_max_scan_checks = 0;
+    int64_t critical_tests = 0;
+    int64_t non_critical_tests = 0;
+    int64_t critical_scan_checks = 0;
+    int64_t decrease_end_max_attempts = 0;
+    // Disjoint scopes, both included in the watcher Propagator total_ns.
+    int64_t synchronize_ns = 0;
+    int64_t sorted_views_ns = 0;
+    int64_t window_and_critical_ns = 0;
+  };
+
   explicit GenericLiteralWatcher(Model* model);
 
   // This type is neither copyable nor movable.
@@ -1114,6 +1136,9 @@ class GenericLiteralWatcher final : public SatPropagator {
 
   // Registers a propagator and returns its unique ids.
   int Register(PropagatorInterface* propagator);
+
+  bool RuntimeDiagnosticsEnabled() const { return runtime_diagnostics_; }
+  void SetRuntimeNotLastStats(int id, const RuntimeNotLastStats* stats);
 
   // Changes the priority of the propagator with given id. The priority is a
   // non-negative integer. Propagators with a lower priority will always be
@@ -1266,6 +1291,8 @@ class GenericLiteralWatcher final : public SatPropagator {
     int64_t integer_enqueues = 0;
     int64_t boolean_enqueues = 0;
     int64_t conflicts = 0;
+    // Non-owning pointer; model-owned propagator keeps the stats alive in Solve.
+    const RuntimeNotLastStats* runtime_not_last = nullptr;
   };
   std::vector<std::string> runtime_propagator_names_;
   std::vector<RuntimePropagatorStats> runtime_propagator_stats_;

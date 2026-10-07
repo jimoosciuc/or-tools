@@ -1798,6 +1798,7 @@ cc_library(
         ":linear_constraint",
         ":model",
         ":precedences",
+        ":runtime_progress",
         ":sat_base",
         ":sat_solver",
         "//ortools/base",

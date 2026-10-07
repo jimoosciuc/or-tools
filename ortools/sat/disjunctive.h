@@ -295,7 +295,8 @@ class DisjunctiveNotLast : public PropagatorInterface {
   int RegisterWith(GenericLiteralWatcher* watcher);
 
  private:
-  bool PropagateSubwindow();
+  bool PropagateSubwindow(
+      GenericLiteralWatcher::RuntimeNotLastStats* runtime_stats);
 
   FixedCapacityVector<TaskTime> start_min_window_;
   FixedCapacityVector<TaskTime> start_max_window_;
@@ -304,6 +305,8 @@ class DisjunctiveNotLast : public PropagatorInterface {
   SchedulingConstraintHelper* helper_;
   TaskSet task_set_;
   PropagationStatistics stats_;
+  GenericLiteralWatcher::RuntimeNotLastStats runtime_stats_;
+  bool runtime_diagnostics_ = false;
 };
 
 class DisjunctiveEdgeFinding : public PropagatorInterface {

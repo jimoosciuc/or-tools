@@ -2275,6 +2275,33 @@ bool GenericLiteralWatcher::Propagate(Trail* trail) {
                             " max_ns=", item.max_ns, " int=",
                             item.integer_enqueues, " bool=",
                             item.boolean_enqueues, " conflicts=", item.conflicts);
+            if (item.runtime_not_last != nullptr) {
+              const RuntimeNotLastStats& detail = *item.runtime_not_last;
+              absl::StrAppend(&hotspots, " notlast_watcher_id=", hot,
+                              " notlast_tasks=",
+                              detail.num_tasks, " direction=",
+                              detail.is_forward ? "forward" : "backward",
+                              " windows=", detail.windows,
+                              " start_min_scan_checks=",
+                              detail.start_min_scan_checks,
+                              " start_max_scan_checks=",
+                              detail.start_max_scan_checks,
+                              " start_min_le_one_windows=",
+                              detail.one_task_windows, " empty_start_max_windows=",
+                              detail.empty_start_max_windows, " subwindows=",
+                              detail.subwindows, " critical_queue_le_one_subwindows=",
+                              detail.critical_queue_le_one_subwindows,
+                              " end_max_scan_checks=", detail.end_max_scan_checks,
+                              " critical_tests=", detail.critical_tests,
+                              " non_critical_tests=", detail.non_critical_tests,
+                              " critical_scan_checks=", detail.critical_scan_checks,
+                              " decrease_end_max_attempts=",
+                              detail.decrease_end_max_attempts,
+                              " synchronize_ns=", detail.synchronize_ns,
+                              " sorted_views_ns=", detail.sorted_views_ns,
+                              " window_and_critical_ns=",
+                              detail.window_and_critical_ns);
+            }
           }
           RuntimeProgressPrint(absl::StrCat(
               "CP-SAT-RUNTIME event=PROPAGATOR_SUMMARY owner=",
@@ -2414,6 +2441,12 @@ int GenericLiteralWatcher::Register(PropagatorInterface* propagator) {
   in_queue_.push_back(true);
   queue_by_priority_[1].push_back(id);
   return id;
+}
+
+void GenericLiteralWatcher::SetRuntimeNotLastStats(
+    int id, const RuntimeNotLastStats* stats) {
+  if (!runtime_diagnostics_) return;
+  runtime_propagator_stats_[id].runtime_not_last = stats;
 }
 
 void GenericLiteralWatcher::SetPropagatorPriority(int id, int priority) {

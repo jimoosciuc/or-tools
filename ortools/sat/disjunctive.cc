@@ -27,6 +27,7 @@
 #include "ortools/sat/intervals.h"
 #include "ortools/sat/model.h"
 #include "ortools/sat/precedences.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_parameters.pb.h"
 #include "ortools/sat/theta_tree.h"
@@ -1343,16 +1344,34 @@ int DisjunctivePrecedences::RegisterWith(GenericLiteralWatcher* watcher) {
 }
 
 bool DisjunctiveNotLast::Propagate() {
+  auto* runtime_stats =
+      runtime_diagnostics_ ? &runtime_stats_ : nullptr;
+  const int64_t runtime_start =
+      runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   stats_.OnPropagate();
+  int64_t phase_start = runtime_start;
   if (!helper_->SynchronizeAndSetTimeDirection(time_direction_)) {
     ++stats_.num_conflicts;
+    if (runtime_stats != nullptr) {
+      runtime_stats->synchronize_ns += RuntimeProgressNowNanos() - phase_start;
+    }
     return false;
+  }
+  if (runtime_stats != nullptr) {
+    const int64_t now = RuntimeProgressNowNanos();
+    runtime_stats->synchronize_ns += now - phase_start;
+    phase_start = now;
   }
 
   const auto task_by_negated_start_max =
       helper_->TaskByIncreasingNegatedStartMax();
   const auto task_by_increasing_shifted_start_min =
       helper_->TaskByIncreasingShiftedStartMin();
+  if (runtime_stats != nullptr) {
+    const int64_t now = RuntimeProgressNowNanos();
+    runtime_stats->sorted_views_ns += now - phase_start;
+    phase_start = now;
+  }
 
   // Split problem into independent part.
   //
@@ -1368,9 +1387,11 @@ bool DisjunctiveNotLast::Propagate() {
   int queue_index = task_by_negated_start_max.size() - 1;
   const int num_tasks = task_by_increasing_shifted_start_min.size();
   for (int i = 0; i < num_tasks;) {
+    if (runtime_stats != nullptr) ++runtime_stats->windows;
     start_min_window_.clear();
     IntegerValue window_end = kMinIntegerValue;
     for (; i < num_tasks; ++i) {
+      if (runtime_stats != nullptr) ++runtime_stats->start_min_scan_checks;
       const auto [task, presence_lit, start_min] =
           task_by_increasing_shifted_start_min[i];
       if (!helper_->IsPresent(presence_lit)) continue;
@@ -1390,6 +1411,7 @@ bool DisjunctiveNotLast::Propagate() {
     // fall into [window_start, window_end).
     start_max_window_.clear();
     for (; queue_index >= 0; queue_index--) {
+      if (runtime_stats != nullptr) ++runtime_stats->start_max_scan_checks;
       const auto [t, negated_start_max] =
           task_by_negated_start_max[queue_index];
       const IntegerValue start_max = -negated_start_max;
@@ -1403,20 +1425,37 @@ bool DisjunctiveNotLast::Propagate() {
     // If this is the case, we cannot propagate more than the detectable
     // precedence propagator. Note that this continue must happen after we
     // computed start_max_window_ though.
-    if (start_min_window_.size() <= 1) continue;
+    if (start_min_window_.size() <= 1) {
+      if (runtime_stats != nullptr) ++runtime_stats->one_task_windows;
+      continue;
+    }
 
     // Process current window.
-    if (!start_max_window_.empty() && !PropagateSubwindow()) {
-      ++stats_.num_conflicts;
-      return false;
+    if (start_max_window_.empty()) {
+      if (runtime_stats != nullptr) ++runtime_stats->empty_start_max_windows;
+    } else {
+      if (runtime_stats != nullptr) ++runtime_stats->subwindows;
+      if (!PropagateSubwindow(runtime_stats)) {
+        ++stats_.num_conflicts;
+        if (runtime_stats != nullptr) {
+          runtime_stats->window_and_critical_ns +=
+              RuntimeProgressNowNanos() - phase_start;
+        }
+        return false;
+      }
     }
   }
 
   stats_.EndWithoutConflicts();
+  if (runtime_stats != nullptr) {
+    runtime_stats->window_and_critical_ns +=
+        RuntimeProgressNowNanos() - phase_start;
+  }
   return true;
 }
 
-bool DisjunctiveNotLast::PropagateSubwindow() {
+bool DisjunctiveNotLast::PropagateSubwindow(
+    GenericLiteralWatcher::RuntimeNotLastStats* runtime_stats) {
   auto& task_by_increasing_end_max = start_max_window_;
   for (TaskTime& entry : task_by_increasing_end_max) {
     entry.time = helper_->EndMax(entry.task_index);
@@ -1438,7 +1477,12 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
 
   // If the size is one, we cannot propagate more than the detectable precedence
   // propagator.
-  if (queue_size <= 1) return true;
+  if (queue_size <= 1) {
+    if (runtime_stats != nullptr) {
+      ++runtime_stats->critical_queue_le_one_subwindows;
+    }
+    return true;
+  }
 
   task_by_increasing_start_max.resize(queue_size);
   std::sort(task_by_increasing_start_max.begin(),
@@ -1447,6 +1491,7 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
   task_set_.Clear();
   int queue_index = 0;
   for (const auto task_time : task_by_increasing_end_max) {
+    if (runtime_stats != nullptr) ++runtime_stats->end_max_scan_checks;
     const int t = task_time.task_index;
     const IntegerValue end_max = task_time.time;
 
@@ -1482,7 +1527,11 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
     int critical_index = 0;
     const IntegerValue end_min_of_critical_tasks =
         task_set_.ComputeEndMin(/*task_to_ignore=*/t, &critical_index);
-    if (end_min_of_critical_tasks <= helper_->StartMax(t)) continue;
+    if (runtime_stats != nullptr) ++runtime_stats->critical_tests;
+    if (end_min_of_critical_tasks <= helper_->StartMax(t)) {
+      if (runtime_stats != nullptr) ++runtime_stats->non_critical_tests;
+      continue;
+    }
 
     // Find the largest start-max of the critical tasks (excluding t). The
     // end-max for t need to be smaller than or equal to this.
@@ -1491,6 +1540,7 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
         task_set_.SortedTasks();
     const int sorted_tasks_size = sorted_tasks.size();
     for (int i = critical_index; i < sorted_tasks_size; ++i) {
+      if (runtime_stats != nullptr) ++runtime_stats->critical_scan_checks;
       const int ct = sorted_tasks[i].task;
       if (t == ct) continue;
       const IntegerValue start_max = helper_->StartMax(ct);
@@ -1536,6 +1586,9 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
       // Enqueue the new end-max for t.
       // Note that changing it will not influence the rest of the loop.
       ++stats_.num_propagations;
+      if (runtime_stats != nullptr) {
+        ++runtime_stats->decrease_end_max_attempts;
+      }
       if (!helper_->DecreaseEndMax(t, largest_ct_start_max)) return false;
     }
   }
@@ -1544,6 +1597,12 @@ bool DisjunctiveNotLast::PropagateSubwindow() {
 
 int DisjunctiveNotLast::RegisterWith(GenericLiteralWatcher* watcher) {
   const int id = watcher->Register(this);
+  runtime_diagnostics_ = watcher->RuntimeDiagnosticsEnabled();
+  if (runtime_diagnostics_) {
+    runtime_stats_.num_tasks = helper_->NumTasks();
+    runtime_stats_.is_forward = time_direction_;
+    watcher->SetRuntimeNotLastStats(id, &runtime_stats_);
+  }
   helper_->WatchAllTasks(id);
   watcher->NotifyThatPropagatorMayNotReachFixedPointInOnePass(id);
   return id;
