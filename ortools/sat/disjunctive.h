@@ -288,6 +288,7 @@ class DisjunctiveNotLast : public PropagatorInterface {
       : time_direction_(time_direction),
         helper_(helper),
         task_set_(helper->NumTasks()),
+        task_to_theta_event_(helper->NumTasks(), 0),
         stats_("DisjunctiveNotLast", model) {
     start_min_window_.ClearAndReserve(helper->NumTasks());
     start_max_window_.ClearAndReserve(helper->NumTasks());
@@ -305,6 +306,12 @@ class DisjunctiveNotLast : public PropagatorInterface {
   const bool time_direction_;
   SchedulingConstraintHelper* helper_;
   TaskSet task_set_;
+  ThetaLambdaTree<IntegerValue> theta_tree_;
+  // Zero is outside the window, positive is inactive event + 1, and negative
+  // is active -(event + 1).
+  std::vector<int> task_to_theta_event_;
+  std::vector<int> theta_mapped_tasks_;
+  std::vector<TaskSet::Entry> theta_entries_by_event_;
   PropagationStatistics stats_;
   GenericLiteralWatcher::RuntimeNotLastStats runtime_stats_;
   bool runtime_diagnostics_ = false;

@@ -1114,6 +1114,10 @@ class GenericLiteralWatcher final : public SatPropagator {
     int64_t task_set_insertions = 0;
     int64_t task_set_shifted_positions = 0;
     int64_t compute_end_min_scanned_positions = 0;
+    int64_t theta_tree_prefilter_tests = 0;
+    int64_t theta_tree_non_critical_skips = 0;
+    int64_t theta_tree_event_activations = 0;
+    int64_t theta_tree_taskset_rebuilds = 0;
     // Disjoint scopes, both included in the watcher Propagator total_ns.
     int64_t synchronize_ns = 0;
     int64_t sorted_views_ns = 0;

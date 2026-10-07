@@ -1463,6 +1463,11 @@ bool DisjunctiveNotLast::Propagate() {
 
 bool DisjunctiveNotLast::PropagateSubwindow(
     GenericLiteralWatcher::RuntimeNotLastStats* runtime_stats) {
+  for (const int task : theta_mapped_tasks_) {
+    task_to_theta_event_[task] = 0;
+  }
+  theta_mapped_tasks_.clear();
+
   auto& task_by_increasing_end_max = start_max_window_;
   IntegerValue threshold = kMinIntegerValue;
   for (TaskTime& entry : task_by_increasing_end_max) {
@@ -1489,6 +1494,22 @@ bool DisjunctiveNotLast::PropagateSubwindow(
     return true;
   }
 
+  // Keep event ids in shifted-start-min order. The tree is only used until
+  // the first candidate that may propagate; after that, helper bounds can
+  // change and the original TaskSet path is used for the rest of the window.
+  theta_tree_.Reset(queue_size);
+  theta_entries_by_event_.resize(queue_size);
+  for (int event = 0; event < queue_size; ++event) {
+    const int task = task_by_increasing_start_max[event].task_index;
+    theta_entries_by_event_[event] =
+        {task, helper_->ShiftedStartMin(task), helper_->SizeMin(task)};
+    theta_mapped_tasks_.push_back(task);
+  }
+  std::sort(theta_entries_by_event_.begin(), theta_entries_by_event_.end());
+  for (int event = 0; event < queue_size; ++event) {
+    task_to_theta_event_[theta_entries_by_event_[event].task] = event + 1;
+  }
+
   int64_t sort_start =
       runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   IncrementalSort(task_by_increasing_end_max.begin(),
@@ -1507,6 +1528,7 @@ bool DisjunctiveNotLast::PropagateSubwindow(
   const int64_t candidate_scan_start =
       runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   task_set_.Clear();
+  bool task_set_initialized = false;
   int queue_index = 0;
   for (const auto task_time : task_by_increasing_end_max) {
     if (runtime_stats != nullptr) ++runtime_stats->end_max_scan_checks;
@@ -1527,14 +1549,73 @@ bool DisjunctiveNotLast::PropagateSubwindow(
 
       const int task_index = to_insert.task_index;
       DCHECK(helper_->IsPresent(task_index));
-      if (runtime_stats != nullptr) ++runtime_stats->task_set_insertions;
-      task_set_.AddEntry(
-          {task_index, helper_->ShiftedStartMin(task_index),
-           helper_->SizeMin(task_index)},
-          runtime_stats != nullptr
-              ? &runtime_stats->task_set_shifted_positions
-              : nullptr);
+      if (task_set_initialized) {
+        if (runtime_stats != nullptr) ++runtime_stats->task_set_insertions;
+        task_set_.AddEntry(
+            {task_index, helper_->ShiftedStartMin(task_index),
+             helper_->SizeMin(task_index)},
+            runtime_stats != nullptr
+                ? &runtime_stats->task_set_shifted_positions
+                : nullptr);
+      } else {
+        const int event_code = task_to_theta_event_[task_index];
+        DCHECK_GT(event_code, 0);
+        const int event = event_code - 1;
+        const TaskSet::Entry& entry = theta_entries_by_event_[event];
+        theta_tree_.AddOrUpdateEvent(event, entry.start_min, entry.size_min,
+                                     entry.size_min);
+        task_to_theta_event_[task_index] = -event_code;
+        if (runtime_stats != nullptr) {
+          ++runtime_stats->theta_tree_event_activations;
+        }
+      }
       ++queue_index;
+    }
+
+    if (!task_set_initialized) {
+      const int event_code = task_to_theta_event_[t];
+      IntegerValue envelope = kMinIntegerValue;
+      if (event_code < 0) {
+        const int event = -event_code - 1;
+        const TaskSet::Entry& entry = theta_entries_by_event_[event];
+        theta_tree_.RemoveEvent(event);
+        envelope = theta_tree_.GetEnvelope();
+        theta_tree_.AddOrUpdateEvent(event, entry.start_min, entry.size_min,
+                                     entry.size_min);
+      } else {
+        envelope = theta_tree_.GetEnvelope();
+      }
+      if (runtime_stats != nullptr) {
+        ++runtime_stats->theta_tree_prefilter_tests;
+      }
+      if (envelope <= helper_->StartMax(t)) {
+        if (runtime_stats != nullptr) {
+          ++runtime_stats->critical_tests;
+          ++runtime_stats->non_critical_tests;
+          ++runtime_stats->theta_tree_non_critical_skips;
+        }
+        continue;
+      }
+
+      // The exact tree envelope allows a critical inference. Rebuild the
+      // TaskSet in the same insertion order, then keep using it so later
+      // helper updates cannot invalidate the prefilter's saved entries.
+      for (int i = 0; i < queue_index; ++i) {
+        const int active_task = task_by_increasing_start_max[i].task_index;
+        const int active_event_code = task_to_theta_event_[active_task];
+        DCHECK_LT(active_event_code, 0);
+        const int active_event = -active_event_code - 1;
+        if (runtime_stats != nullptr) ++runtime_stats->task_set_insertions;
+        task_set_.AddEntry(
+            theta_entries_by_event_[active_event],
+            runtime_stats != nullptr
+                ? &runtime_stats->task_set_shifted_positions
+                : nullptr);
+      }
+      task_set_initialized = true;
+      if (runtime_stats != nullptr) {
+        ++runtime_stats->theta_tree_taskset_rebuilds;
+      }
     }
 
     // In the following case, task t cannot be after all the critical tasks
