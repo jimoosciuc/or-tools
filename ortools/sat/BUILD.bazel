@@ -1641,6 +1641,7 @@ cc_library(
         ":pseudo_costs",
         ":restart",
         ":rins",
+        ":runtime_progress",
         ":sat_base",
         ":sat_decision",
         ":sat_inprocessing",
