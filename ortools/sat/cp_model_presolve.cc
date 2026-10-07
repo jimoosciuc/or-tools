@@ -23,6 +23,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -12633,6 +12634,8 @@ bool CpModelPresolver::ProcessChangedVariables(std::vector<bool>* in_queue,
 namespace {
 
 struct DiffBoundsStats {
+  const char* algorithm = "none";
+  const char* potential_skip_reason = "not_attempted";
   int64_t candidates = 0;
   int64_t arcs = 0;
   int64_t arc_work = 0;
@@ -12640,6 +12643,11 @@ struct DiffBoundsStats {
   int64_t bound_updates = 0;
   int64_t build_wall_ns = 0;
   int64_t propagation_wall_ns = 0;
+  int64_t potential_edge_checks = 0;
+  int64_t potential_heap_pops = 0;
+  int64_t potential_heap_pushes = 0;
+  int64_t potential_closure_updates = 0;
+  int64_t potential_wall_ns = 0;
   bool work_limit_reached = false;
   bool interrupted = false;
 };
@@ -12666,6 +12674,192 @@ struct DiffBoundsArc {
   int head_ref;
   absl::int128 offset;
 };
+
+struct PotentialEdge {
+  int head;
+  absl::int128 reduced_cost;
+};
+
+// Returns nullopt when the hint cannot safely support this fast path. In that
+// case the caller keeps the original bounded queue propagation unchanged.
+std::optional<bool> TryPropagateWithHintPotential(
+    PresolveContext* context, absl::Span<const DiffBoundsArc> arcs,
+    bool runtime_diagnostics, DiffBoundsStats* stats) {
+  const int64_t start_ns =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
+  const auto finish = [&]() {
+    if (runtime_diagnostics) {
+      stats->potential_wall_ns = RuntimeProgressNowNanos() - start_ns;
+    }
+  };
+  const auto fallback = [&](const char* reason) -> std::optional<bool> {
+    stats->potential_skip_reason = reason;
+    stats->algorithm = "bounded_queue_fallback";
+    finish();
+    return std::nullopt;
+  };
+
+  // Distances are reweighted with the hint. In the signed graph, every
+  // difference arc t + c <= h has a dual arc -h + c <= -t.
+  absl::flat_hash_map<int, int> node_index_by_var;
+  std::vector<int> active_vars;
+  auto add_ref = [&](int ref) {
+    const int var = PositiveRef(ref);
+    if (node_index_by_var
+            .try_emplace(var, static_cast<int>(active_vars.size()))
+            .second) {
+      active_vars.push_back(var);
+    }
+  };
+  for (int i = 0; i < arcs.size(); ++i) {
+    if ((i & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    add_ref(arcs[i].tail_ref);
+    add_ref(arcs[i].head_ref);
+  }
+
+  if (active_vars.size() > std::numeric_limits<int>::max() / 2) {
+    return fallback("numeric_overflow");
+  }
+  const int num_nodes = 2 * static_cast<int>(active_vars.size());
+  std::vector<absl::int128> potential(num_nodes);
+  std::vector<absl::int128> distance(num_nodes);
+  const SolutionCrush& crush = context->solution_crush();
+  for (int i = 0; i < active_vars.size(); ++i) {
+    if ((i & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    const int var = active_vars[i];
+    const Domain domain = context->DomainOf(var);
+    if (domain.NumIntervals() != 1) {
+      return fallback("non_interval_domain");
+    }
+    const std::optional<int64_t> hint = crush.GetVarValueIfPresent(var);
+    if (!hint.has_value()) return fallback("missing_hint");
+    if (!domain.Contains(*hint)) return fallback("invalid_potential");
+    potential[2 * i] = *hint;
+    potential[2 * i + 1] = -absl::int128(*hint);
+    distance[2 * i] = absl::int128(*hint) - domain.Min();
+    distance[2 * i + 1] =
+        -absl::int128(*hint) + domain.Max();
+    if (distance[2 * i] < 0 || distance[2 * i + 1] < 0) {
+      return fallback("invalid_potential");
+    }
+  }
+
+  std::vector<std::vector<PotentialEdge>> graph(num_nodes);
+  int64_t work = 0;
+  const auto node_of = [&](int ref) {
+    return 2 * node_index_by_var.at(PositiveRef(ref)) +
+           (RefIsPositive(ref) ? 0 : 1);
+  };
+  for (const DiffBoundsArc& arc : arcs) {
+    if ((work++ & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    const int tail = node_of(arc.tail_ref);
+    const int head = node_of(arc.head_ref);
+    ++stats->potential_edge_checks;
+    const absl::int128 reduced_cost =
+        potential[head] - potential[tail] - arc.offset;
+    if (reduced_cost < 0) return fallback("invalid_potential");
+    graph[tail].push_back({head, reduced_cost});
+
+    const int dual_tail = node_of(NegatedRef(arc.head_ref));
+    const int dual_head = node_of(NegatedRef(arc.tail_ref));
+    ++stats->potential_edge_checks;
+    const absl::int128 dual_reduced_cost =
+        potential[dual_head] - potential[dual_tail] - arc.offset;
+    if (dual_reduced_cost < 0) return fallback("invalid_potential");
+    graph[dual_tail].push_back({dual_head, dual_reduced_cost});
+  }
+
+  struct QueueEntry {
+    absl::int128 distance;
+    int node;
+  };
+  struct QueueEntryGreater {
+    bool operator()(const QueueEntry& a, const QueueEntry& b) const {
+      return a.distance != b.distance ? a.distance > b.distance
+                                       : a.node > b.node;
+    }
+  };
+  std::priority_queue<QueueEntry, std::vector<QueueEntry>, QueueEntryGreater>
+      queue;
+  for (int node = 0; node < num_nodes; ++node) {
+    if ((node & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    queue.push({distance[node], node});
+    ++stats->potential_heap_pushes;
+  }
+  work = 0;
+  while (!queue.empty()) {
+    if ((work++ & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    const QueueEntry entry = queue.top();
+    queue.pop();
+    ++stats->potential_heap_pops;
+    if (entry.distance != distance[entry.node]) continue;
+    for (const PotentialEdge& edge : graph[entry.node]) {
+      if ((work++ & 1023) == 0 && context->time_limit()->LimitReached()) {
+        stats->interrupted = true;
+        return fallback("interrupted");
+      }
+      ++stats->potential_edge_checks;
+      const absl::int128 candidate = entry.distance + edge.reduced_cost;
+      if (candidate < distance[edge.head]) {
+        distance[edge.head] = candidate;
+        queue.push({candidate, edge.head});
+        ++stats->potential_heap_pushes;
+      }
+    }
+  }
+
+  std::vector<int64_t> lower(active_vars.size());
+  std::vector<int64_t> upper(active_vars.size());
+  for (int i = 0; i < active_vars.size(); ++i) {
+    if ((i & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      return fallback("interrupted");
+    }
+    const absl::int128 min_value = potential[2 * i] - distance[2 * i];
+    const absl::int128 max_value =
+        -(potential[2 * i + 1] - distance[2 * i + 1]);
+    if (!FitsInt64(min_value) || !FitsInt64(max_value) ||
+        min_value > max_value) {
+      return fallback("numeric_overflow");
+    }
+    lower[i] = static_cast<int64_t>(min_value);
+    upper[i] = static_cast<int64_t>(max_value);
+  }
+
+  stats->algorithm = "potential_dijkstra";
+  for (int i = 0; i < active_vars.size(); ++i) {
+    if ((i & 1023) == 0 && context->time_limit()->LimitReached()) {
+      stats->interrupted = true;
+      break;
+    }
+    bool changed = false;
+    if (!context->IntersectDomainWith(active_vars[i],
+                                      Domain(lower[i], upper[i]), &changed)) {
+      stats->potential_skip_reason = "unexpected_empty_intersection";
+      finish();
+      return false;
+    }
+    if (changed) ++stats->potential_closure_updates;
+  }
+  stats->potential_skip_reason = "none";
+  finish();
+  return true;
+}
 
 // Adds bounds entailed by unconditioned two-variable linear constraints.
 // The original constraints remain in the normal presolve queue.
@@ -12752,6 +12946,17 @@ bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
     }
     return feasible;
   }
+  if (runtime_diagnostics) {
+    stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+  }
+  const std::optional<bool> potential_result =
+      TryPropagateWithHintPotential(context, arcs, runtime_diagnostics, stats);
+  if (potential_result.has_value()) return *potential_result;
+  if (stats->interrupted) return true;
+
+  stats->algorithm = "bounded_queue_fallback";
+  const int64_t queue_build_start_ns =
+      runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
   const int64_t work_limit = 4 * stats->arcs;
   const int num_variables = model->variables_size();
   std::vector<std::vector<int>> incident_arcs(num_variables);
@@ -12765,7 +12970,8 @@ bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
   }
   if (stats->interrupted) {
     if (runtime_diagnostics) {
-      stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+      stats->build_wall_ns +=
+          RuntimeProgressNowNanos() - queue_build_start_ns;
     }
     return true;
   }
@@ -12800,7 +13006,7 @@ bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
     queue.push_back(i);
   }
   if (runtime_diagnostics) {
-    stats->build_wall_ns = RuntimeProgressNowNanos() - build_start_ns;
+    stats->build_wall_ns += RuntimeProgressNowNanos() - queue_build_start_ns;
   }
 
   const int64_t propagation_start_ns =
@@ -13127,11 +13333,19 @@ void CpModelPresolver::PresolveToFixPoint() {
   if (runtime_diagnostics) {
     emit_runtime_event(absl::StrCat(
         "CP-SAT-RUNTIME event=PFP_DIFF_BOUNDS pfp_id=", pfp_id,
+        " algorithm=", diff_bounds_stats.algorithm,
+        " potential_skip_reason=", diff_bounds_stats.potential_skip_reason,
         " candidates=", diff_bounds_stats.candidates,
         " arcs=", diff_bounds_stats.arcs,
         " arc_work=", diff_bounds_stats.arc_work,
         " arc_checks=", diff_bounds_stats.arc_checks,
         " bound_updates=", diff_bounds_stats.bound_updates,
+        " potential_edge_checks=", diff_bounds_stats.potential_edge_checks,
+        " potential_heap_pops=", diff_bounds_stats.potential_heap_pops,
+        " potential_heap_pushes=", diff_bounds_stats.potential_heap_pushes,
+        " potential_closure_updates=",
+        diff_bounds_stats.potential_closure_updates,
+        " potential_wall_ns=", diff_bounds_stats.potential_wall_ns,
         " work_limit_reached=", diff_bounds_stats.work_limit_reached,
         " interrupted=", diff_bounds_stats.interrupted,
         " feasible=", diff_bounds_feasible,

@@ -280,6 +280,15 @@ class SolutionCrush {
   // Stores the solution as a hint in the given model.
   void StoreSolutionAsHint(CpModelProto& model) const;
 
+  // Returns the current value for a positive variable, if one is available.
+  std::optional<int64_t> GetVarValueIfPresent(int var) const {
+    if (var < 0 || var >= static_cast<int>(var_has_value_.size()) ||
+        !HasValue(var)) {
+      return std::nullopt;
+    }
+    return GetVarValue(var);
+  }
+
   // Given a list of N disjoint packing areas (each described by a union of
   // rectangles) and a list of M boxes (described by their x and y interval
   // constraints in the `model` proto), sets the value of the literals in
