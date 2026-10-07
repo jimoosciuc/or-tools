@@ -19,6 +19,7 @@
 #include <functional>
 #include <random>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -42,6 +43,7 @@
 #include "ortools/sat/pseudo_costs.h"
 #include "ortools/sat/restart.h"
 #include "ortools/sat/rins.h"
+#include "ortools/sat/runtime_progress.h"
 #include "ortools/sat/sat_base.h"
 #include "ortools/sat/sat_decision.h"
 #include "ortools/sat/sat_inprocessing.h"
@@ -1349,7 +1351,92 @@ IntegerSearchHelper::IntegerSearchHelper(Model* model)
       product_detector_(model->GetOrCreate<ProductDetector>()),
       time_limit_(model->GetOrCreate<TimeLimit>()),
       pseudo_costs_(model->GetOrCreate<PseudoCosts>()),
-      inprocessing_(model->GetOrCreate<Inprocessing>()) {}
+      inprocessing_(model->GetOrCreate<Inprocessing>()) {
+  if (parameters_.cp_sat_runtime_diagnostics()) {
+    cp_model_mapping_ = model->Get<CpModelMapping>();
+    const CpModelProto* proto = cp_model_mapping_ == nullptr
+                                    ? nullptr
+                                    : cp_model_mapping_->GetCpModelProto();
+    runtime_decision_diagnostics_ = proto != nullptr;
+  }
+  if (runtime_decision_diagnostics_) {
+    const CpModelProto* proto = cp_model_mapping_->GetCpModelProto();
+    runtime_decisions_by_proto_variable_.resize(proto->variables_size(), 0);
+    runtime_decision_last_summary_ns_ = RuntimeProgressNowNanos();
+  }
+}
+
+void IntegerSearchHelper::RecordSelectedDecision(
+    const BooleanOrIntegerLiteral& decision) {
+  if (!runtime_decision_diagnostics_) return;
+
+  int proto_variable = -1;
+  if (decision.boolean_literal_index != kNoLiteralIndex) {
+    ++runtime_boolean_decisions_;
+    proto_variable = cp_model_mapping_->GetProtoVariableFromBooleanVariable(
+        Literal(decision.boolean_literal_index).Variable());
+  } else {
+    const IntegerLiteral integer_decision = decision.integer_literal;
+    if (VariableIsPositive(integer_decision.var)) {
+      ++runtime_integer_lower_decisions_;
+    } else {
+      ++runtime_integer_upper_decisions_;
+    }
+    proto_variable = cp_model_mapping_->GetProtoVariableFromIntegerVariable(
+        PositiveVariable(integer_decision.var));
+  }
+
+  ++runtime_selected_decisions_;
+  if (proto_variable >= 0 &&
+      static_cast<size_t>(proto_variable) <
+          runtime_decisions_by_proto_variable_.size()) {
+    ++runtime_decisions_by_proto_variable_[proto_variable];
+  } else {
+    ++runtime_unmapped_decisions_;
+  }
+  if ((runtime_selected_decisions_ & 1023) == 0) {
+    MaybePrintSelectedDecisionSummary();
+  }
+}
+
+void IntegerSearchHelper::MaybePrintSelectedDecisionSummary() {
+  const int64_t now_ns = RuntimeProgressNowNanos();
+  const int64_t period_ns = static_cast<int64_t>(
+      parameters_.cp_sat_runtime_diagnostics_period_seconds()) * 1000000000;
+  if (now_ns - runtime_decision_last_summary_ns_ < period_ns) return;
+  runtime_decision_last_summary_ns_ = now_ns;
+
+  std::vector<std::pair<int64_t, int>> top;
+  top.reserve(10);
+  for (int i = 0;
+       i < static_cast<int>(runtime_decisions_by_proto_variable_.size()); ++i) {
+    const int64_t count = runtime_decisions_by_proto_variable_[i];
+    if (count == 0) continue;
+    if (top.size() < 10) {
+      top.emplace_back(count, i);
+      continue;
+    }
+    const auto min_it = std::min_element(top.begin(), top.end());
+    if (count > min_it->first) *min_it = {count, i};
+  }
+  std::sort(top.begin(), top.end(), std::greater<>());
+
+  const CpModelProto* proto = cp_model_mapping_->GetCpModelProto();
+  std::string top_variables;
+  for (const auto& [count, proto_variable] : top) {
+    if (!top_variables.empty()) top_variables.push_back(';');
+    absl::StrAppend(&top_variables, proto_variable, ":",
+                    proto->variables(proto_variable).name(), ":", count);
+  }
+  RuntimeProgressPrint(absl::StrCat(
+      "CP-SAT-RUNTIME event=DECISION_SUMMARY owner=", model_->Name(),
+      " selected_decisions=", runtime_selected_decisions_,
+      " boolean_decisions=", runtime_boolean_decisions_,
+      " integer_lower_decisions=", runtime_integer_lower_decisions_,
+      " integer_upper_decisions=", runtime_integer_upper_decisions_,
+      " unmapped_decisions=", runtime_unmapped_decisions_,
+      " top_proto_variables=", top_variables, "\n"));
+}
 
 bool IntegerSearchHelper::BeforeTakingDecision() {
   // If we pushed root level deductions, we restart to incorporate them.
@@ -1449,7 +1536,10 @@ bool IntegerSearchHelper::GetDecision(
     if (!new_decision.HasValue()) break;
 
     *decision = GetDecisionLiteral(new_decision);
-    if (*decision != kNoLiteralIndex) break;
+    if (*decision != kNoLiteralIndex) {
+      RecordSelectedDecision(new_decision);
+      break;
+    }
   }
   return true;
 }

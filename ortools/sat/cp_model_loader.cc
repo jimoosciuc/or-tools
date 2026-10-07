@@ -127,6 +127,7 @@ bool ConstraintIsNEq(const LinearConstraintProto& proto,
 void LoadVariables(const CpModelProto& model_proto,
                    bool view_all_booleans_as_integers, Model* m) {
   auto* mapping = m->GetOrCreate<CpModelMapping>();
+  mapping->SetCpModelProto(&model_proto);
   const int num_proto_variables = model_proto.variables_size();
 
   // All [0, 1] variables always have a corresponding Boolean, even if it is

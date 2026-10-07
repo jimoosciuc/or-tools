@@ -65,6 +65,12 @@ struct ObjectiveDefinition {
 // This also holds some information used when loading a CpModel proto.
 class CpModelMapping {
  public:
+  void SetCpModelProto(const CpModelProto* cp_model_proto) {
+    cp_model_proto_ = cp_model_proto;
+  }
+
+  const CpModelProto* GetCpModelProto() const { return cp_model_proto_; }
+
   // Returns true if the given CpModelProto variable reference refers to a
   // Boolean variable. Such variable will always have an associated Literal(),
   // but not always an associated Integer().
@@ -209,6 +215,8 @@ class CpModelMapping {
   int NumProtoVariables() const { return integers_.size(); }
 
  private:
+  // Non-owning: the loaded model proto outlives its Model search.
+  const CpModelProto* cp_model_proto_ = nullptr;
   friend void LoadVariables(const CpModelProto& model_proto,
                             bool view_all_booleans_as_integers, Model* m);
   friend void ExtractEncoding(const CpModelProto& model_proto, Model* m);

@@ -325,6 +325,19 @@ class IntegerSearchHelper {
   PseudoCosts* pseudo_costs_;
   Inprocessing* inprocessing_;
 
+  void RecordSelectedDecision(const BooleanOrIntegerLiteral& decision);
+  void MaybePrintSelectedDecisionSummary();
+
+  const CpModelMapping* cp_model_mapping_ = nullptr;
+  bool runtime_decision_diagnostics_ = false;
+  std::vector<int64_t> runtime_decisions_by_proto_variable_;
+  int64_t runtime_selected_decisions_ = 0;
+  int64_t runtime_boolean_decisions_ = 0;
+  int64_t runtime_integer_lower_decisions_ = 0;
+  int64_t runtime_integer_upper_decisions_ = 0;
+  int64_t runtime_unmapped_decisions_ = 0;
+  int64_t runtime_decision_last_summary_ns_ = 0;
+
   bool must_process_conflict_ = false;
 };
 
