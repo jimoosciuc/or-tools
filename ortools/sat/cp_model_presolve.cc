@@ -12680,8 +12680,8 @@ struct PotentialEdge {
   absl::int128 reduced_cost;
 };
 
-// Returns nullopt when the hint cannot safely support this fast path. In that
-// case the caller keeps the original bounded queue propagation unchanged.
+// Returns nullopt when the hint cannot safely support this fast path. The
+// caller can then use the bounded queue fallback or keep the original queue.
 std::optional<bool> TryPropagateWithHintPotential(
     PresolveContext* context, absl::Span<const DiffBoundsArc> arcs,
     bool runtime_diagnostics, DiffBoundsStats* stats) {
@@ -12694,7 +12694,6 @@ std::optional<bool> TryPropagateWithHintPotential(
   };
   const auto fallback = [&](const char* reason) -> std::optional<bool> {
     stats->potential_skip_reason = reason;
-    stats->algorithm = "bounded_queue_fallback";
     finish();
     return std::nullopt;
   };
@@ -12865,7 +12864,8 @@ std::optional<bool> TryPropagateWithHintPotential(
 // The original constraints remain in the normal presolve queue.
 bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
                                          bool runtime_diagnostics,
-                                         DiffBoundsStats* stats) {
+                                         DiffBoundsStats* stats,
+                                         bool allow_bounded_queue_fallback) {
   const int64_t build_start_ns =
       runtime_diagnostics ? RuntimeProgressNowNanos() : 0;
   std::vector<DiffBoundsArc> arcs;
@@ -12953,6 +12953,10 @@ bool PropagateTwoVariableDifferenceBounds(PresolveContext* context,
       TryPropagateWithHintPotential(context, arcs, runtime_diagnostics, stats);
   if (potential_result.has_value()) return *potential_result;
   if (stats->interrupted) return true;
+  if (!allow_bounded_queue_fallback) {
+    stats->algorithm = "potential_skipped";
+    return true;
+  }
 
   stats->algorithm = "bounded_queue_fallback";
   const int64_t queue_build_start_ns =
@@ -13110,6 +13114,10 @@ void CpModelPresolver::PresolveToFixPoint() {
   int64_t input_two_var_diff_constraints = 0;
   int64_t processed_constraints = 0;
   int64_t processed_two_var_diff_constraints = 0;
+  int64_t difference_bounds_round_batches = 0;
+  int64_t difference_bounds_round_closure_updates = 0;
+  const char* difference_bounds_round_last_skip_reason = "not_attempted";
+  bool run_difference_bounds_rounds = false;
   bool input_samples_emitted = false;
   const auto is_two_var_diff_candidate = [](const ConstraintProto& ct) {
     if (ct.constraint_case() != ConstraintProto::kLinear ||
@@ -13135,6 +13143,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   enum PfpPhase {
     kQueueInitializeSort,
     kDifferenceBoundsEntryBatch,
+    kDifferenceBoundsRoundBatch,
     kQueueDrainBatch,
     kSmallDegreeVariables,
     kChangedVariables,
@@ -13172,6 +13181,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   };
   constexpr std::array<const char*, kPfpPhaseCount> kPfpPhaseNames = {
       "queue_initialize_sort", "difference_bounds_entry_batch",
+      "difference_bounds_round_batches",
       "queue_drain_batches",
       "small_degree_variable_pass", "process_changed_variables",
       "encoding_variable_pass", "dual_model_scan", "dual_strengthen",
@@ -13223,6 +13233,11 @@ void CpModelPresolver::PresolveToFixPoint() {
         " queue_constraint_calls=", processed_constraints,
         " queue_two_var_diff_candidate_calls=",
         processed_two_var_diff_constraints,
+        " difference_bounds_round_batches=", difference_bounds_round_batches,
+        " difference_bounds_round_closure_updates=",
+        difference_bounds_round_closure_updates,
+        " difference_bounds_round_last_skip_reason=",
+        difference_bounds_round_last_skip_reason,
         " pfp_nonempty_domain_intersections_cumulative=",
         context_->runtime_domain_change_intersections(),
         " pfp_candidate_source_nonempty_domain_intersections_cumulative=",
@@ -13328,7 +13343,8 @@ void CpModelPresolver::PresolveToFixPoint() {
       phase_timer(kDifferenceBoundsEntryBatch);
   DiffBoundsStats diff_bounds_stats;
   const bool diff_bounds_feasible = PropagateTwoVariableDifferenceBounds(
-      context_, runtime_diagnostics, &diff_bounds_stats);
+      context_, runtime_diagnostics, &diff_bounds_stats,
+      /*allow_bounded_queue_fallback=*/true);
   difference_bounds_entry_batch.Finish();
   if (runtime_diagnostics) {
     emit_runtime_event(absl::StrCat(
@@ -13355,6 +13371,10 @@ void CpModelPresolver::PresolveToFixPoint() {
         /*use_solver_logger=*/true);
   }
   if (!diff_bounds_feasible) return;
+  run_difference_bounds_rounds =
+      std::string_view(diff_bounds_stats.algorithm) == "potential_dijkstra" &&
+      std::string_view(diff_bounds_stats.potential_skip_reason) == "none" &&
+      !diff_bounds_stats.interrupted;
 
   // We put a hard limit on the number of loop to prevent some corner case with
   // propagation loops. Note that the limit is quite high so it shouldn't really
@@ -13365,6 +13385,25 @@ void CpModelPresolver::PresolveToFixPoint() {
     if (time_limit_->LimitReached()) break;
     if (context_->ModelIsUnsat()) break;
     if (context_->num_presolve_operations > max_num_operations) break;
+    if (num_loops > 0 && run_difference_bounds_rounds) {
+      PfpPhaseTimer difference_bounds_round_batch =
+          phase_timer(kDifferenceBoundsRoundBatch);
+      DiffBoundsStats round_stats;
+      const bool round_feasible = PropagateTwoVariableDifferenceBounds(
+          context_, runtime_diagnostics, &round_stats,
+          /*allow_bounded_queue_fallback=*/false);
+      difference_bounds_round_batch.Finish();
+      ++difference_bounds_round_batches;
+      difference_bounds_round_closure_updates +=
+          round_stats.potential_closure_updates;
+      difference_bounds_round_last_skip_reason =
+          round_stats.potential_skip_reason;
+      if (!round_feasible) return;
+      run_difference_bounds_rounds =
+          std::string_view(round_stats.algorithm) == "potential_dijkstra" &&
+          std::string_view(round_stats.potential_skip_reason) == "none" &&
+          !round_stats.interrupted;
+    }
     if (runtime_diagnostics) {
       const int64_t now = RuntimeProgressNowNanos();
       if (now - last_phase_summary_ns >= runtime_period_ns) {
