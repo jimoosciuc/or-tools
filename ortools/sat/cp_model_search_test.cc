@@ -135,6 +135,67 @@ TEST(BasicFixedSearchBehaviorTest, Default) {
   EXPECT_THAT(response.solution(), testing::ElementsAre(4, 3, 0, 5, 6));
 }
 
+TEST(DynamicDisjunctiveSearchTest, ZeroDurationLaunchAtSharedStart) {
+  for (const bool with_hint : {false, true}) {
+    // Launching at t=0 lets independent work finish at t=10. Putting the
+    // three-unit host task first delays the launch and completion to t=13.
+    CpModelProto model_proto = ParseTestProto(R"pb(
+      variables { domain: [ 0, 1 ] }
+      variables { domain: [ 0, 3 ] }
+      variables { domain: [ 0, 3 ] }
+      variables { domain: [ 10, 13 ] }
+      constraints {
+        interval {
+          start { vars: 0 coeffs: 1 }
+          size { offset: 3 }
+          end { vars: 0 coeffs: 1 offset: 3 }
+        }
+      }
+      constraints {
+        interval {
+          start { vars: 1 coeffs: 1 }
+          size { offset: 0 }
+          end { vars: 1 coeffs: 1 }
+        }
+      }
+      constraints { no_overlap { intervals: [ 0, 1 ] } }
+      constraints { linear { vars: [ 1, 2 ] coeffs: [ -1, 1 ] domain: [ 0, 0 ] } }
+      constraints {
+        lin_max {
+          target { vars: 3 coeffs: 1 }
+          exprs { vars: 0 coeffs: 1 offset: 3 }
+          exprs { vars: 2 coeffs: 1 offset: 10 }
+        }
+      }
+      objective { vars: 3 coeffs: 1 scaling_factor: 1 }
+    )pb");
+    if (with_hint) {
+      *model_proto.mutable_solution_hint() = ParseTestProto(R"pb(
+        vars: [ 0, 1, 2, 3 ] values: [ 0, 3, 3, 13 ]
+      )pb");
+    }
+    Model model;
+    model.Add(NewSatParameters(
+        "cp_model_presolve:false,search_branching:FIXED_SEARCH,num_workers:1,"
+        "linearization_level:0,new_linear_propagation:false,"
+        "use_dynamic_precedence_in_disjunctive:true,hint_conflict_limit:0"));
+    std::vector<double> objectives;
+    model.Add(NewFeasibleSolutionObserver([&](const CpSolverResponse& response) {
+      objectives.push_back(response.objective_value());
+    }));
+    const CpSolverResponse response = SolveCpModel(model_proto, &model);
+    EXPECT_EQ(response.status(), CpSolverStatus::OPTIMAL);
+    EXPECT_EQ(response.objective_value(), 10);
+    EXPECT_EQ(response.solution(1), 0);
+    EXPECT_EQ(response.solution(2), 0);
+    if (with_hint) {
+      EXPECT_THAT(objectives, testing::ElementsAre(13, 10));
+    } else {
+      EXPECT_THAT(objectives, testing::ElementsAre(10));
+    }
+  }
+}
+
 TEST(BasicFixedSearchBehaviorTest, ReverseOrder) {
   // Note that SELECT_LOWER_HALF or SELECT_MIN_VALUE result in the same
   // solution.

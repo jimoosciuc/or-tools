@@ -775,9 +775,13 @@ class DisjunctiveDecisionDiagnostics {
 
 bool PrecedenceIsBetter(SchedulingConstraintHelper* helper, int a,
                         SchedulingConstraintHelper* other_helper, int other_a) {
-  return std::make_tuple(helper->StartMin(a), helper->StartMax(a),
+  // A zero-size task can run at a positive-size task's start without delaying
+  // either task. Prefer that order before comparing their latest start times.
+  return std::make_tuple(helper->StartMin(a), helper->SizeMax(a) != 0,
+                         helper->StartMax(a),
                          helper->SizeMin(a)) <
          std::make_tuple(other_helper->StartMin(other_a),
+                         other_helper->SizeMax(other_a) != 0,
                          other_helper->StartMax(other_a),
                          other_helper->SizeMin(other_a));
 }
