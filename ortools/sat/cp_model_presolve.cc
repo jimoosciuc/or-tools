@@ -12976,6 +12976,14 @@ void CpModelPresolver::PresolveToFixPoint() {
     return PfpPhaseTimer(runtime_diagnostics ? &pfp_phase_stats[phase]
                                              : nullptr);
   };
+  auto emit_runtime_event = [&](const std::string& message,
+                                bool use_solver_logger) {
+    if (use_solver_logger && context_->logger()->LoggingIsEnabled()) {
+      SOLVER_LOG(context_->logger(), message);
+    } else {
+      RuntimeProgressPrint(absl::StrCat(message, "\n"));
+    }
+  };
   auto emit_phase_summary = [&](int64_t now, const char* boundary,
                                 bool queue_batch_active) {
     if (!runtime_diagnostics) return;
@@ -12993,7 +13001,7 @@ void CpModelPresolver::PresolveToFixPoint() {
                       "|calls_total=", current.calls,
                       "|wall_ns_total=", current.wall_ns, "]");
     }
-    RuntimeProgressPrint(absl::StrCat(
+    emit_runtime_event(absl::StrCat(
         "CP-SAT-RUNTIME event=PFP_PHASE_SUMMARY pfp_id=", pfp_id,
         " boundary=", boundary, " elapsed_ns=", now - pfp_id,
         " period_ns=", now - last_phase_summary_ns,
@@ -13015,7 +13023,8 @@ void CpModelPresolver::PresolveToFixPoint() {
         context_->runtime_domain_change_two_var_diff_intersections(),
         " two_var_diff_input_sample_count=", two_var_diff_sample_count,
         " two_var_diff_input_samples_emitted=", emit_input_samples,
-        " phases=", phase_summary, "\n"));
+        " phases=", phase_summary),
+        /*use_solver_logger=*/std::string_view(boundary) == "end");
     if (emit_input_samples) {
       for (int i = 0; i < two_var_diff_sample_count; ++i) {
         const TwoVarDiffSample& sample = (*two_var_diff_samples)[i];
@@ -13116,7 +13125,7 @@ void CpModelPresolver::PresolveToFixPoint() {
       context_, runtime_diagnostics, &diff_bounds_stats);
   difference_bounds_entry_batch.Finish();
   if (runtime_diagnostics) {
-    RuntimeProgressPrint(absl::StrCat(
+    emit_runtime_event(absl::StrCat(
         "CP-SAT-RUNTIME event=PFP_DIFF_BOUNDS pfp_id=", pfp_id,
         " candidates=", diff_bounds_stats.candidates,
         " arcs=", diff_bounds_stats.arcs,
@@ -13128,7 +13137,8 @@ void CpModelPresolver::PresolveToFixPoint() {
         " feasible=", diff_bounds_feasible,
         " build_wall_ns=", diff_bounds_stats.build_wall_ns,
         " propagation_wall_ns=", diff_bounds_stats.propagation_wall_ns,
-        " scope=single_entry_batch_original_constraints_retained\n"));
+        " scope=single_entry_batch_original_constraints_retained"),
+        /*use_solver_logger=*/true);
   }
   if (!diff_bounds_feasible) return;
 
