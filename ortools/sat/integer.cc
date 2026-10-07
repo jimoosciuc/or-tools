@@ -2297,10 +2297,19 @@ bool GenericLiteralWatcher::Propagate(Trail* trail) {
                               " critical_scan_checks=", detail.critical_scan_checks,
                               " decrease_end_max_attempts=",
                               detail.decrease_end_max_attempts,
+                              " task_set_insertions=",
+                              detail.task_set_insertions,
+                              " task_set_shifted_positions=",
+                              detail.task_set_shifted_positions,
+                              " compute_end_min_scanned_positions=",
+                              detail.compute_end_min_scanned_positions,
                               " synchronize_ns=", detail.synchronize_ns,
                               " sorted_views_ns=", detail.sorted_views_ns,
                               " window_and_critical_ns=",
-                              detail.window_and_critical_ns);
+                              detail.window_and_critical_ns,
+                              " end_max_sort_ns=", detail.end_max_sort_ns,
+                              " start_max_sort_ns=", detail.start_max_sort_ns,
+                              " candidate_scan_ns=", detail.candidate_scan_ns);
             }
           }
           RuntimeProgressPrint(absl::StrCat(

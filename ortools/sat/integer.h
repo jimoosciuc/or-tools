@@ -1111,10 +1111,17 @@ class GenericLiteralWatcher final : public SatPropagator {
     int64_t non_critical_tests = 0;
     int64_t critical_scan_checks = 0;
     int64_t decrease_end_max_attempts = 0;
+    int64_t task_set_insertions = 0;
+    int64_t task_set_shifted_positions = 0;
+    int64_t compute_end_min_scanned_positions = 0;
     // Disjoint scopes, both included in the watcher Propagator total_ns.
     int64_t synchronize_ns = 0;
     int64_t sorted_views_ns = 0;
     int64_t window_and_critical_ns = 0;
+    // Disjoint subwindow scopes included in window_and_critical_ns.
+    int64_t end_max_sort_ns = 0;
+    int64_t start_max_sort_ns = 0;
+    int64_t candidate_scan_ns = 0;
   };
 
   explicit GenericLiteralWatcher(Model* model);

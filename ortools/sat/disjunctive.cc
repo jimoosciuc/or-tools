@@ -164,14 +164,16 @@ void AddDisjunctiveWithBooleanPrecedencesOnly(
   }
 }
 
-void TaskSet::AddEntry(const Entry& e) {
+void TaskSet::AddEntry(const Entry& e, int64_t* shifted_positions) {
   int j = sorted_tasks_.size();
+  const int old_size = j;
   sorted_tasks_.push_back(e);
   while (j > 0 && sorted_tasks_[j - 1].start_min > e.start_min) {
     sorted_tasks_[j] = sorted_tasks_[j - 1];
     --j;
   }
   sorted_tasks_[j] = e;
+  if (shifted_positions != nullptr) *shifted_positions += old_size - j;
   DCHECK(std::is_sorted(sorted_tasks_.begin(), sorted_tasks_.end()));
 
   // If the task is added after optimized_restart_, we know that we don't need
@@ -220,7 +222,8 @@ IntegerValue TaskSet::ComputeEndMin() const {
 }
 
 IntegerValue TaskSet::ComputeEndMin(int task_to_ignore,
-                                    int* critical_index) const {
+                                    int* critical_index,
+                                    int64_t* scanned_positions) const {
   // The order in which we process tasks with the same start-min doesn't matter.
   DCHECK(std::is_sorted(sorted_tasks_.begin(), sorted_tasks_.end()));
   bool ignored = false;
@@ -234,7 +237,8 @@ IntegerValue TaskSet::ComputeEndMin(int task_to_ignore,
     optimized_restart_ = 0;
   }
 
-  for (int i = optimized_restart_; i < size; ++i) {
+  const int scan_index = optimized_restart_;
+  for (int i = scan_index; i < size; ++i) {
     const Entry& e = sorted_tasks_[i];
     if (e.task == task_to_ignore) {
       ignored = true;
@@ -247,6 +251,9 @@ IntegerValue TaskSet::ComputeEndMin(int task_to_ignore,
     } else {
       end_min += e.size_min;
     }
+  }
+  if (scanned_positions != nullptr) {
+    *scanned_positions += size - scan_index;
   }
   return end_min;
 }
@@ -1482,12 +1489,23 @@ bool DisjunctiveNotLast::PropagateSubwindow(
     return true;
   }
 
+  int64_t sort_start =
+      runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   IncrementalSort(task_by_increasing_end_max.begin(),
                   task_by_increasing_end_max.end());
+  if (runtime_stats != nullptr) {
+    runtime_stats->end_max_sort_ns += RuntimeProgressNowNanos() - sort_start;
+  }
   task_by_increasing_start_max.resize(queue_size);
+  sort_start = runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   std::sort(task_by_increasing_start_max.begin(),
             task_by_increasing_start_max.end());
+  if (runtime_stats != nullptr) {
+    runtime_stats->start_max_sort_ns += RuntimeProgressNowNanos() - sort_start;
+  }
 
+  const int64_t candidate_scan_start =
+      runtime_stats != nullptr ? RuntimeProgressNowNanos() : 0;
   task_set_.Clear();
   int queue_index = 0;
   for (const auto task_time : task_by_increasing_end_max) {
@@ -1509,8 +1527,13 @@ bool DisjunctiveNotLast::PropagateSubwindow(
 
       const int task_index = to_insert.task_index;
       DCHECK(helper_->IsPresent(task_index));
-      task_set_.AddEntry({task_index, helper_->ShiftedStartMin(task_index),
-                          helper_->SizeMin(task_index)});
+      if (runtime_stats != nullptr) ++runtime_stats->task_set_insertions;
+      task_set_.AddEntry(
+          {task_index, helper_->ShiftedStartMin(task_index),
+           helper_->SizeMin(task_index)},
+          runtime_stats != nullptr
+              ? &runtime_stats->task_set_shifted_positions
+              : nullptr);
       ++queue_index;
     }
 
@@ -1526,7 +1549,11 @@ bool DisjunctiveNotLast::PropagateSubwindow(
     // Note that this works as well when the presence of t is still unknown.
     int critical_index = 0;
     const IntegerValue end_min_of_critical_tasks =
-        task_set_.ComputeEndMin(/*task_to_ignore=*/t, &critical_index);
+        task_set_.ComputeEndMin(
+            /*task_to_ignore=*/t, &critical_index,
+            runtime_stats != nullptr
+                ? &runtime_stats->compute_end_min_scanned_positions
+                : nullptr);
     if (runtime_stats != nullptr) ++runtime_stats->critical_tests;
     if (end_min_of_critical_tasks <= helper_->StartMax(t)) {
       if (runtime_stats != nullptr) ++runtime_stats->non_critical_tests;
@@ -1580,6 +1607,10 @@ bool DisjunctiveNotLast::PropagateSubwindow(
       // because the task is known to be after all the other, and thus it cannot
       // be "not last".
       if (largest_ct_start_max == kMinIntegerValue) {
+        if (runtime_stats != nullptr) {
+          runtime_stats->candidate_scan_ns +=
+              RuntimeProgressNowNanos() - candidate_scan_start;
+        }
         return helper_->ReportConflict();
       }
 
@@ -1589,8 +1620,18 @@ bool DisjunctiveNotLast::PropagateSubwindow(
       if (runtime_stats != nullptr) {
         ++runtime_stats->decrease_end_max_attempts;
       }
-      if (!helper_->DecreaseEndMax(t, largest_ct_start_max)) return false;
+      if (!helper_->DecreaseEndMax(t, largest_ct_start_max)) {
+        if (runtime_stats != nullptr) {
+          runtime_stats->candidate_scan_ns +=
+              RuntimeProgressNowNanos() - candidate_scan_start;
+        }
+        return false;
+      }
     }
+  }
+  if (runtime_stats != nullptr) {
+    runtime_stats->candidate_scan_ns +=
+        RuntimeProgressNowNanos() - candidate_scan_start;
   }
   return true;
 }

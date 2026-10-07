@@ -74,7 +74,7 @@ class TaskSet {
     sorted_tasks_.clear();
     optimized_restart_ = 0;
   }
-  void AddEntry(const Entry& e);
+  void AddEntry(const Entry& e, int64_t* shifted_positions = nullptr);
 
   // Same as AddEntry({t, helper->ShiftedStartMin(t), helper->SizeMin(t)}).
   // This is a minor optimization to not call SizeMin(t) twice.
@@ -110,7 +110,8 @@ class TaskSet {
   // It is possible to behave like if one task was not in the set by setting
   // task_to_ignore to the id of this task. This returns 0 if the set is empty
   // in which case critical_index will be left unchanged.
-  IntegerValue ComputeEndMin(int task_to_ignore, int* critical_index) const;
+  IntegerValue ComputeEndMin(int task_to_ignore, int* critical_index,
+                             int64_t* scanned_positions = nullptr) const;
   IntegerValue ComputeEndMin() const;
 
   // Warning, this is only valid if ComputeEndMin() was just called. It is the
