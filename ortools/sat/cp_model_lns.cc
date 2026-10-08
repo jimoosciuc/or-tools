@@ -2262,14 +2262,14 @@ Neighborhood SchedulingTimeWindowNeighborhoodGenerator::Generate(
   std::vector<int> intervals_to_relax;
   intervals_to_relax.reserve(partition.selected_indices.size());
   std::vector<int> variables_to_fix;
-  intervals_to_relax.insert(intervals_to_relax.end(),
-                            partition.selected_indices.begin(),
-                            partition.selected_indices.end());
+  for (const int index : partition.selected_indices) {
+    intervals_to_relax.push_back(active_intervals[index]);
+  }
 
   if (helper_.Parameters().push_all_tasks_toward_start()) {
-    intervals_to_relax.insert(intervals_to_relax.end(),
-                              partition.indices_before_selected.begin(),
-                              partition.indices_before_selected.end());
+    for (const int index : partition.indices_before_selected) {
+      intervals_to_relax.push_back(active_intervals[index]);
+    }
     AppendVarsFromAllIntervalIndices(partition.indices_before_selected,
                                      active_intervals, helper_.ModelProto(),
                                      &variables_to_fix);
@@ -2292,14 +2292,14 @@ Neighborhood SchedulingResourceWindowsNeighborhoodGenerator::Generate(
     const TimePartition partition = PartitionIndicesAroundRandomTimeWindow(
         active_intervals, helper_.ModelProto(), initial_solution,
         data.difficulty, random);
-    intervals_to_relax.insert(intervals_to_relax.end(),
-                              partition.selected_indices.begin(),
-                              partition.selected_indices.end());
+    for (const int index : partition.selected_indices) {
+      intervals_to_relax.push_back(active_intervals[index]);
+    }
 
     if (helper_.Parameters().push_all_tasks_toward_start()) {
-      intervals_to_relax.insert(intervals_to_relax.end(),
-                                partition.indices_before_selected.begin(),
-                                partition.indices_before_selected.end());
+      for (const int index : partition.indices_before_selected) {
+        intervals_to_relax.push_back(active_intervals[index]);
+      }
       AppendVarsFromAllIntervalIndices(partition.indices_before_selected,
                                        active_intervals, helper_.ModelProto(),
                                        &variables_to_fix);
