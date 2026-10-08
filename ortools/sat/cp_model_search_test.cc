@@ -25,6 +25,8 @@
 #include "ortools/base/logging.h"
 #include "ortools/base/parse_test_proto.h"
 #include "ortools/sat/cp_model.pb.h"
+#include "ortools/sat/cp_model_checker.h"
+#include "ortools/sat/cp_model_lns.h"
 #include "ortools/sat/cp_model_solver.h"
 #include "ortools/sat/model.h"
 #include "ortools/sat/sat_parameters.pb.h"
@@ -134,6 +136,114 @@ TEST(BasicFixedSearchBehaviorTest, Default) {
   EXPECT_EQ(response.status(), CpSolverStatus::OPTIMAL);
   EXPECT_THAT(response.solution(), testing::ElementsAre(4, 3, 0, 5, 6));
 }
+
+class SchedulingWindowNeighborhoodTest
+    : public testing::TestWithParam<std::tuple<bool, bool>> {};
+
+TEST_P(SchedulingWindowNeighborhoodTest, SparseIntervalIndicesAllowImprovement) {
+  const auto [resource_windows, push_toward_start] = GetParam();
+  CpModelProto proto;
+  CpSolverResponse initial;
+  // Four jobs can each switch from resource A to resource B. Non-interval
+  // constraints precede the sparse interval indices [4, 6, 8, 10].
+  for (int job = 0; job < 4; ++job) {
+    auto* presence = proto.add_variables();
+    presence->add_domain(0);
+    presence->add_domain(1);
+    auto* start = proto.add_variables();
+    start->add_domain(0);
+    start->add_domain(10);
+    initial.add_solution(1);
+    initial.add_solution(2 * job + 2);
+    auto* tautology = proto.add_constraints()->mutable_bool_or();
+    tautology->add_literals(2 * job);
+    tautology->add_literals(-2 * job - 1);
+    proto.mutable_objective()->add_vars(2 * job);
+    proto.mutable_objective()->add_coeffs(100);
+  }
+  proto.mutable_objective()->add_vars(7);
+  proto.mutable_objective()->add_coeffs(1);
+  std::vector<std::vector<int>> resources(2);
+  for (int job = 0; job < 4; ++job) {
+    for (int resource = 0; resource < 2; ++resource) {
+      resources[resource].push_back(proto.constraints_size());
+      auto* constraint = proto.add_constraints();
+      constraint->add_enforcement_literal(resource == 0 ? 2 * job
+                                                       : -2 * job - 1);
+      auto* interval = constraint->mutable_interval();
+      interval->mutable_start()->add_vars(2 * job + 1);
+      interval->mutable_start()->add_coeffs(1);
+      interval->mutable_size()->set_offset(1);
+      interval->mutable_end()->add_vars(2 * job + 1);
+      interval->mutable_end()->add_coeffs(1);
+      interval->mutable_end()->set_offset(1);
+    }
+  }
+  for (const auto& resource : resources) {
+    auto* no_overlap = proto.add_constraints()->mutable_no_overlap();
+    for (const int index : resource) no_overlap->add_intervals(index);
+  }
+  ASSERT_TRUE(SolutionIsFeasible(proto, initial.solution()));
+  SatParameters parameters;
+  parameters.set_num_workers(1);
+  parameters.set_push_all_tasks_toward_start(push_toward_start);
+  Model model;
+  model.Add(NewSatParameters(parameters));
+  auto* response_manager = model.GetOrCreate<SharedResponseManager>();
+  response_manager->InitializeObjective(proto);
+  NeighborhoodGeneratorHelper helper(&proto, &parameters, response_manager);
+  SchedulingTimeWindowNeighborhoodGenerator time_generator(&helper, "time");
+  SchedulingResourceWindowsNeighborhoodGenerator resource_generator(
+      &helper, resources, "resource");
+  NeighborhoodGenerator& generator =
+      resource_windows ? static_cast<NeighborhoodGenerator&>(resource_generator)
+                       : static_cast<NeighborhoodGenerator&>(time_generator);
+  bool saw_window_after_first_job = false;
+  for (int seed = 0; seed < 16; ++seed) {
+    SCOPED_TRACE(seed);
+    std::mt19937 random(seed);
+    NeighborhoodGenerator::SolveData data;
+    data.difficulty = 0.5;
+    const Neighborhood neighborhood = generator.Generate(initial, data, random);
+    ASSERT_TRUE(neighborhood.is_generated);
+    int relaxed_presences = 0;
+    int first_relaxed_job = -1;
+    for (int job = 0; job < 4; ++job) {
+      const auto& domain = neighborhood.delta.variables(2 * job).domain();
+      if (domain.Get(0) != domain.Get(domain.size() - 1)) {
+        ++relaxed_presences;
+        if (first_relaxed_job == -1) first_relaxed_job = job;
+      }
+    }
+    EXPECT_EQ(relaxed_presences, 2);
+    saw_window_after_first_job |= first_relaxed_job == 1;
+
+    CpModelProto local = proto;
+    *local.mutable_variables() = neighborhood.delta.variables();
+    local.mutable_constraints()->MergeFrom(neighborhood.delta.constraints());
+    *local.mutable_solution_hint() = neighborhood.delta.solution_hint();
+    ASSERT_TRUE(SolutionIsFeasible(local, initial.solution()));
+    const CpSolverResponse result = SolveWithParameters(local, parameters);
+    ASSERT_EQ(result.status(), CpSolverStatus::OPTIMAL);
+    EXPECT_TRUE(SolutionIsFeasible(proto, result.solution()));
+    // Exactly two jobs can switch resources (cost 200). Normally the last
+    // job follows one other job on A and starts at 1. When the window is
+    // jobs 1,2 and push-toward-start is enabled, job 0 stays fixed at t=2
+    // but its precedence to job 3 is released, allowing job 3 to start at 0.
+    const int expected_objective =
+        push_toward_start && first_relaxed_job == 1 ? 200 : 201;
+    EXPECT_EQ(result.objective_value(), expected_objective);
+    if (push_toward_start && first_relaxed_job == 1) {
+      EXPECT_EQ(result.solution(1), 2);
+      EXPECT_EQ(result.solution(7), 0);
+    }
+  }
+  EXPECT_TRUE(saw_window_after_first_job);
+}
+
+INSTANTIATE_TEST_SUITE_P(BothGeneratorsAndPushModes,
+                         SchedulingWindowNeighborhoodTest,
+                         testing::Combine(testing::Bool(), testing::Bool()));
 
 TEST(DynamicDisjunctiveSearchTest, ZeroDurationLaunchAtSharedStart) {
   for (const bool with_hint : {false, true}) {

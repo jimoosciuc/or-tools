@@ -456,6 +456,8 @@ cc_test(
     srcs = ["cp_model_search_test.cc"],
     deps = [
         ":cp_model_cc_proto",
+        ":cp_model_checker",
+        ":cp_model_lns",
         ":cp_model_solver",
         ":model",
         ":sat_parameters_cc_proto",
