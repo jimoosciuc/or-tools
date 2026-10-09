@@ -15,11 +15,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -31,6 +34,7 @@
 
 #include "absl/algorithm/container.h"
 #include "absl/base/attributes.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
@@ -42,6 +46,7 @@
 #include "absl/numeric/int128.h"
 #include "absl/random/distributions.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/escaping.h"
 #include "absl/strings/str_cat.h"
 #include "absl/types/span.h"
 #include "google/protobuf/arena.h"
@@ -12619,8 +12624,25 @@ bool CpModelPresolver::ProcessChangedVariables(std::vector<bool>* in_queue,
 }
 
 void CpModelPresolver::PresolveToFixPoint() {
-  if (time_limit_->LimitReached()) return;
-  if (context_->ModelIsUnsat()) return;
+  const char* observation_env = std::getenv("ORTOOLS_CP_SAT_PFP_OBSERVATION");
+  const bool observe = observation_env != nullptr &&
+                       std::string_view(observation_env) == "1" &&
+                       logger_->LoggingIsEnabled();
+  static std::atomic<uint64_t> next_observation_id{0};
+  const uint64_t observation_id = observe ? ++next_observation_id : 0;
+  const auto emit = [&](const std::string& message) {
+    if (observe) {
+      SOLVER_LOG(logger_, "[PFP_OBSERVER] call=", observation_id, " ", message);
+    }
+  };
+  if (time_limit_->LimitReached()) {
+    if (observe) emit("skipped=wall_budget");
+    return;
+  }
+  if (context_->ModelIsUnsat()) {
+    if (observe) emit("skipped=unsat");
+    return;
+  }
   PresolveTimer timer(__FUNCTION__, logger_, time_limit_);
 
   // We do at most 2 tests per PresolveToFixPoint() call since this can be slow.
@@ -12669,21 +12691,148 @@ void CpModelPresolver::PresolveToFixPoint() {
   // be reached in most situation.
   int num_loops = 0;
   constexpr int kMaxNumLoops = 1000;
+  std::string exit_reason = "queue_empty";
+  std::string function_phase = "fixpoint";
+  int observed_rounds = 0;
+  auto function_observation = absl::MakeCleanup([&] {
+    if (observe) {
+      emit(absl::StrCat("function_exit phase=", function_phase,
+                       " reason=", exit_reason, " unsat=", context_->ModelIsUnsat(),
+                       " queue=", queue.size(), " original_num_loops=", num_loops,
+                       " rounds=", observed_rounds));
+    }
+  });
   for (; num_loops < kMaxNumLoops && !queue.empty(); ++num_loops) {
-    if (time_limit_->LimitReached()) break;
-    if (context_->ModelIsUnsat()) break;
-    if (context_->num_presolve_operations > max_num_operations) break;
+    if (time_limit_->LimitReached()) {
+      exit_reason = "wall_budget";
+      break;
+    }
+    if (context_->ModelIsUnsat()) {
+      exit_reason = "unsat";
+      break;
+    }
+    if (context_->num_presolve_operations > max_num_operations) {
+      exit_reason = "operation_cap";
+      break;
+    }
+    const int round = num_loops + 1;
+    // These are same-round net endpoint changes, not propagation events.
+    const bool sample = observe && (round <= 3 || round == 10 || round == 100 ||
+                                   round == 500 || round == 999 || round == 1000);
+    std::string round_reason = "natural";
+    std::string drain_reason = "queue_empty";
+    // Keys are ConstraintProto::ConstraintCase numeric discriminants.
+    std::map<int, int64_t> processed_types;
+    std::vector<std::pair<int64_t, int64_t>> endpoints;
+    double observation_seconds = 0.0;
+    const auto scan_start = observe ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    if (sample) {
+      endpoints.reserve(context_->working_model->variables_size());
+      for (int v = 0; v < context_->working_model->variables_size(); ++v) {
+        endpoints.emplace_back(context_->MinOf(v), context_->MaxOf(v));
+      }
+    }
+    if (observe) {
+      ++observed_rounds;
+      observation_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - scan_start).count();
+      emit(absl::StrCat("round_begin round=", round, " queue=", queue.size(),
+                       " sample=", sample, " variables=", endpoints.size()));
+    }
+    auto round_observation = absl::MakeCleanup([&] {
+      if (!observe) return;
+      const auto scan_end_start = std::chrono::steady_clock::now();
+      struct Family {
+        int covered = 0, min_up = 0, min_down = 0, max_up = 0, max_down = 0;
+        uint64_t largest = 0;
+        std::string typical, maximum;
+      };
+      std::map<std::string, Family> families;
+      const bool unsat = context_->ModelIsUnsat();
+      if (sample && !unsat) {
+        for (int v = 0; v < endpoints.size(); ++v) {
+          const std::string& name = context_->working_model->variables(v).name();
+          std::string family;
+          bool digit_run = false;
+          for (const char ch : name) {
+            const bool digit = ch >= '0' && ch <= '9';
+            if (!digit || !digit_run) family += digit ? '#' : ch;
+            digit_run = digit;
+          }
+          if (family.empty()) family = "<unnamed>";
+          Family& stats = families[family];
+          ++stats.covered;
+          const auto [old_min, old_max] = endpoints[v];
+          const int64_t new_min = context_->MinOf(v);
+          const int64_t new_max = context_->MaxOf(v);
+          stats.min_up += new_min > old_min;
+          stats.min_down += new_min < old_min;
+          stats.max_up += new_max > old_max;
+          stats.max_down += new_max < old_max;
+          if (old_min == new_min && old_max == new_max) continue;
+          const auto distance = [](int64_t x, int64_t y) -> uint64_t {
+            return x >= y ? uint64_t(x) - uint64_t(y)
+                          : uint64_t(y) - uint64_t(x);
+          };
+          const uint64_t magnitude =
+              std::max(distance(old_min, new_min), distance(old_max, new_max));
+          const std::string detail = absl::StrCat(
+              "v=", v, " name=\"", absl::CEscape(name), "\" min=", old_min,
+              "->", new_min, " max=", old_max, "->", new_max);
+          if (stats.typical.empty()) stats.typical = detail;
+          if (stats.maximum.empty() || magnitude > stats.largest) {
+            stats.largest = magnitude;
+            stats.maximum = detail;
+          }
+        }
+      }
+      observation_seconds += std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - scan_end_start).count();
+      emit(absl::StrCat("round_end round=", round, " queue=", queue.size(),
+                       " reason=", round_reason, " function_reason=", exit_reason,
+                       " drain=", drain_reason,
+                       " sample=", sample, " endpoint_scan_skipped_unsat=", unsat,
+                       " paired_variables=", sample && !unsat ? endpoints.size() : 0,
+                       " new_variables=",
+                       sample ? context_->working_model->variables_size() -
+                                    endpoints.size() : 0,
+                       " scan_aggregate_seconds=", observation_seconds));
+      for (const auto& [type, count] : processed_types) {
+        emit(absl::StrCat("processed round=", round, " constraint_case=", type,
+                         " count=", count));
+      }
+      for (const auto& [family, stats] : families) {
+        emit(absl::StrCat("net_endpoints round=", round, " family=\"",
+                         absl::CEscape(family), "\" covered=", stats.covered,
+                         " min_up=", stats.min_up, " min_down=", stats.min_down,
+                         " max_up=", stats.max_up, " max_down=", stats.max_down,
+                         " typical={", stats.typical, "} largest={", stats.maximum,
+                         "} max_absolute_endpoint_change=", stats.largest));
+      }
+    });
 
     // Empty the queue of single constraint presolve.
     while (!queue.empty() && !context_->ModelIsUnsat()) {
-      if (time_limit_->LimitReached()) break;
-      if (context_->num_presolve_operations > max_num_operations) break;
+      if (time_limit_->LimitReached()) {
+        drain_reason = "wall_budget";
+        exit_reason = "wall_budget";
+        break;
+      }
+      if (context_->num_presolve_operations > max_num_operations) {
+        drain_reason = "operation_cap";
+        exit_reason = "operation_cap";
+        break;
+      }
       const int c = queue.front();
       in_queue[c] = false;
       queue.pop_front();
 
       const int old_num_constraint =
           context_->working_model->constraints_size();
+      if (observe) {
+        ++processed_types[context_->working_model->constraints(c).constraint_case()];
+      }
       const bool changed = PresolveOneConstraint(c);
       if (context_->ModelIsUnsat()) {
         SOLVER_LOG(
@@ -12710,7 +12859,11 @@ void CpModelPresolver::PresolveToFixPoint() {
       }
     }
 
-    if (context_->ModelIsUnsat()) return;
+    if (context_->ModelIsUnsat()) {
+      exit_reason = "unsat";
+      round_reason = "unsat";
+      return;
+    }
 
     in_queue.resize(context_->working_model->constraints_size(), false);
     const auto& vector_that_can_grow_during_iter =
@@ -12726,8 +12879,16 @@ void CpModelPresolver::PresolveToFixPoint() {
 
       // Make sure all affine relations are propagated.
       // This also remove the relation if the degree is now one.
-      if (context_->ModelIsUnsat()) return;
-      if (!PresolveAffineRelationIfAny(v)) return;
+      if (context_->ModelIsUnsat()) {
+        exit_reason = "unsat";
+        round_reason = "unsat";
+        return;
+      }
+      if (!PresolveAffineRelationIfAny(v)) {
+        exit_reason = "affine_failure";
+        round_reason = "affine_failure";
+        return;
+      }
 
       const int degree = context_->VarToConstraints(v).size();
       if (degree == 0) continue;
@@ -12762,7 +12923,10 @@ void CpModelPresolver::PresolveToFixPoint() {
     }
     context_->var_with_reduced_small_degree.SparseClearAll();
 
-    if (ProcessChangedVariables(&in_queue, &queue)) continue;
+    if (ProcessChangedVariables(&in_queue, &queue)) {
+      round_reason = "changed_variables";
+      continue;
+    }
 
     DCHECK(!context_->HasUnusedAffineVariable());
 
@@ -12770,20 +12934,35 @@ void CpModelPresolver::PresolveToFixPoint() {
     for (int v = 0; v < context_->working_model->variables().size(); ++v) {
       ProcessVariableOnlyUsedInEncoding(v);
     }
-    if (ProcessChangedVariables(&in_queue, &queue)) continue;
+    if (ProcessChangedVariables(&in_queue, &queue)) {
+      round_reason = "encoding";
+      continue;
+    }
 
     // Perform dual reasoning.
     //
     // TODO(user): We can support assumptions but we need to not cut them out
     // of the feasible region.
-    if (context_->params().keep_all_feasible_solutions_in_presolve()) break;
-    if (!context_->working_model->assumptions().empty()) break;
+    if (context_->params().keep_all_feasible_solutions_in_presolve()) {
+      exit_reason = "keep_all_feasible";
+      round_reason = "keep_all_feasible";
+      break;
+    }
+    if (!context_->working_model->assumptions().empty()) {
+      exit_reason = "assumptions";
+      round_reason = "assumptions";
+      break;
+    }
 
     // Starts by the "faster" algo that exploit variables that can move freely
     // in one direction. Or variables that are just blocked by one constraint in
     // one direction.
     for (int i = 0; i < 10; ++i) {
-      if (context_->ModelIsUnsat()) return;
+      if (context_->ModelIsUnsat()) {
+        exit_reason = "unsat";
+        round_reason = "unsat";
+        return;
+      }
       ++num_dual_strengthening;
       DualBoundStrengthening dual_bound_strengthening;
       ScanModelForDualBoundStrengthening(*context_, &dual_bound_strengthening);
@@ -12791,7 +12970,11 @@ void CpModelPresolver::PresolveToFixPoint() {
       // TODO(user): Make sure that if we fix one variable, we fix its full
       // symmetric orbit. There should be no reason that we don't do that
       // though.
-      if (!dual_bound_strengthening.Strengthen(context_)) return;
+      if (!dual_bound_strengthening.Strengthen(context_)) {
+        exit_reason = "dual_failure";
+        round_reason = "dual_failure";
+        return;
+      }
       if (ProcessChangedVariables(&in_queue, &queue)) break;
 
       // It is possible we deleted some constraint, but the queue is empty.
@@ -12801,26 +12984,57 @@ void CpModelPresolver::PresolveToFixPoint() {
       // TODO(user): maybe we could reach fix point directly?
       if (dual_bound_strengthening.NumDeletedConstraints() == 0) break;
     }
-    if (!queue.empty()) continue;
+    if (!queue.empty()) {
+      round_reason = "dual_queue";
+      continue;
+    }
 
     // Dominance reasoning will likely break symmetry.
     // TODO(user): We can apply the one that do not break any though, or the
     // operations that are safe.
-    if (context_->params().keep_symmetry_in_presolve()) break;
+    if (context_->params().keep_symmetry_in_presolve()) {
+      exit_reason = "keep_symmetry";
+      round_reason = "keep_symmetry";
+      break;
+    }
 
     // Detect & exploit dominance between variables.
     // TODO(user): This can be slow, remove from fix-pint loop?
     if (num_dominance_tests++ < 2) {
-      if (context_->ModelIsUnsat()) return;
+      if (context_->ModelIsUnsat()) {
+        exit_reason = "unsat";
+        round_reason = "unsat";
+        return;
+      }
       PresolveTimer timer("DetectDominanceRelations", logger_, time_limit_);
       VarDomination var_dom;
       ScanModelForDominanceDetection(*context_, &var_dom);
-      if (!ExploitDominanceRelations(var_dom, context_)) return;
-      if (ProcessChangedVariables(&in_queue, &queue)) continue;
+      if (!ExploitDominanceRelations(var_dom, context_)) {
+        exit_reason = "dominance_failure";
+        round_reason = "dominance_failure";
+        return;
+      }
+      if (ProcessChangedVariables(&in_queue, &queue)) {
+        round_reason = "dominance";
+        continue;
+      }
     }
   }
 
-  if (context_->ModelIsUnsat()) return;
+  if (context_->ModelIsUnsat()) {
+    exit_reason = "unsat";
+    return;
+  }
+
+  if (observe) {
+    if (num_loops == kMaxNumLoops && !queue.empty()) {
+      exit_reason = "1000_cap_with_nonempty_queue";
+    }
+    emit(absl::StrCat("loop_exit reason=", exit_reason, " queue=", queue.size(),
+                     " original_num_loops=", num_loops,
+                     " rounds=", observed_rounds));
+  }
+  function_phase = "post_pass";
 
   // Second "pass" for transformation better done after all of the above and
   // that do not need a fix-point loop.
@@ -12860,6 +13074,7 @@ void CpModelPresolver::PresolveToFixPoint() {
           bool modified = false;
           if (!context_->IntersectDomainWith(pair.first, pair.second,
                                              &modified)) {
+            exit_reason = "post_pass_failure";
             return;
           }
           if (modified) {
@@ -12876,6 +13091,7 @@ void CpModelPresolver::PresolveToFixPoint() {
   timer.AddCounter("num_loops", num_loops);
   timer.AddCounter("num_dual_strengthening", num_dual_strengthening);
   context_->deductions.MarkProcessingAsDoneForNow();
+  function_phase = "complete";
 }
 
 // TODO(user): Use better heuristic?
