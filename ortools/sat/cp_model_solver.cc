@@ -37,6 +37,7 @@
 #include "ortools/base/options.h"
 #endif  // __PORTABLE_PLATFORM__
 #include "absl/base/thread_annotations.h"
+#include "absl/cleanup/cleanup.h"
 #include "absl/container/btree_map.h"
 #include "absl/container/btree_set.h"
 #include "absl/container/flat_hash_map.h"
@@ -1325,7 +1326,24 @@ class LnsSolver : public SubSolver {
 
   std::function<void()> GenerateTask(int64_t task_id) override {
     return [task_id, this]() {
-      if (shared_->SearchIsDone()) return;
+      const char* trace_env = std::getenv("ORTOOLS_CP_SAT_LNS_STAGE_TIMING");
+      const bool trace_enabled =
+          trace_env != nullptr && std::string_view(trace_env) == "1";
+      WallTimer trace_timer;
+      if (trace_enabled) trace_timer.Start();
+      const auto trace = [&](std::string_view event) {
+        if (trace_enabled) {
+          LOG(INFO) << "CP_SAT_LNS_STAGE task_id=" << task_id
+                    << " generator=" << name() << " event=" << event
+                    << " elapsed_s=" << trace_timer.Get();
+        }
+      };
+      const auto task_exit = absl::MakeCleanup([&] { trace("task.exit"); });
+      trace("task.enter");
+      if (shared_->SearchIsDone()) {
+        trace("task.return.search_done_before_start");
+        return;
+      }
 
       // Create a random number generator whose seed depends both on the task_id
       // and on the parameters_.random_seed() so that changing the later will
@@ -1371,10 +1389,15 @@ class LnsSolver : public SubSolver {
         }
       }
 
+      trace("generate.enter");
       Neighborhood neighborhood =
           generator_->Generate(base_response, data, random);
+      trace("generate.exit");
 
-      if (!neighborhood.is_generated) return;
+      if (!neighborhood.is_generated) {
+        trace("task.return.neighborhood_not_generated");
+        return;
+      }
 
       SatParameters local_params;
 
@@ -1426,17 +1449,20 @@ class LnsSolver : public SubSolver {
           &local_model, &lns_fragment, &mapping_proto);
 
       *lns_fragment.mutable_variables() = neighborhood.delta.variables();
+      trace("import.enter");
       {
         ModelCopy copier(context.get());
 
         // Copy and simplify the constraints from the initial model.
         if (!copier.ImportAndSimplifyConstraints(helper_->ModelProto())) {
+          trace("task.return.import_base_failed");
           return;
         }
 
         // Copy and simplify the constraints from the delta model.
         if (!neighborhood.delta.constraints().empty() &&
             !copier.ImportAndSimplifyConstraints(neighborhood.delta)) {
+          trace("task.return.import_delta_failed");
           return;
         }
 
@@ -1444,6 +1470,8 @@ class LnsSolver : public SubSolver {
         // infeasible LNS.
         context->WriteVariableDomainsToProto();
       }
+      trace("import.exit");
+      trace("prepare.enter");
 
       // Copy the rest of the model and overwrite the name.
       CopyEverythingExceptVariablesAndConstraintsFieldsIntoContext(
@@ -1482,6 +1510,7 @@ class LnsSolver : public SubSolver {
         } else {
           // Just regenerate.
           // Note that we do not change the difficulty.
+          trace("task.return.no_relaxed_objective");
           return;
         }
       }
@@ -1513,13 +1542,19 @@ class LnsSolver : public SubSolver {
         CHECK(WriteModelProtoToFile(lns_fragment, lns_name));
       }
 
+      trace("prepare.exit");
       std::vector<int> postsolve_mapping;
+      trace("presolve.enter");
       const CpSolverStatus presolve_status =
           PresolveCpModel(context.get(), &postsolve_mapping);
+      trace("presolve.exit");
 
       // It is important to stop here to avoid using a model for which the
       // presolve was interrupted in the middle.
-      if (local_time_limit->LimitReached()) return;
+      if (local_time_limit->LimitReached()) {
+        trace("task.return.limit_after_presolve");
+        return;
+      }
 
       // Release the context.
       context.reset(nullptr);
@@ -1546,11 +1581,20 @@ class LnsSolver : public SubSolver {
       if (presolve_status == CpSolverStatus::UNKNOWN) {
         // Sometimes when presolve is aborted in the middle, we don't want to
         // load the model as it might fail some DCHECK.
-        if (shared_->SearchIsDone()) return;
+        if (shared_->SearchIsDone()) {
+          trace("task.return.search_done_after_presolve");
+          return;
+        }
 
+        trace("load.enter");
         LoadCpModel(lns_fragment, &local_model);
+        trace("load.exit");
+        trace("hint.enter");
         QuickSolveWithHint(lns_fragment, &local_model);
+        trace("hint.exit");
+        trace("solve.enter");
         SolveLoadedCpModel(lns_fragment, &local_model);
+        trace("solve.exit");
         local_response = local_response_manager->GetResponse();
 
         // In case the LNS model is empty after presolve, the solution
@@ -1571,6 +1615,7 @@ class LnsSolver : public SubSolver {
         local_response = local_response_manager->GetResponse();
         local_response.set_status(presolve_status);
       }
+      trace("result.enter");
       const std::string solution_info = local_response.solution_info();
       std::vector<int64_t> solution_values(local_response.solution().begin(),
                                            local_response.solution().end());
@@ -1610,6 +1655,7 @@ class LnsSolver : public SubSolver {
           }
           LOG(ERROR) << "Infeasible LNS solution! " << solution_info
                      << " solved with params " << local_params;
+          trace("task.return.invalid_postsolved_solution");
           return;
         }
 
@@ -1672,7 +1718,10 @@ class LnsSolver : public SubSolver {
         }
       }
 
+      trace("record.enter");
       generator_->AddSolveData(data);
+      trace("record.exit");
+      trace("result.exit");
 
       if (VLOG_IS_ON(2) && display_lns_info) {
         std::string s = absl::StrCat("              LNS ", name(), ":");
@@ -1710,6 +1759,7 @@ class LnsSolver : public SubSolver {
         absl::MutexLock l(&next_arena_size_mutex_);
         next_arena_size_ = arena.SpaceUsed();
       }
+      trace("cleanup.enter");
     };
   }
 
